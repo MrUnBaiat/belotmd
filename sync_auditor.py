@@ -28,6 +28,8 @@ import json
 import time
 import numpy as np
 
+import combinations as combo
+
 from observation import build_observation
 from belot_sync import (ASCII_TO_ID, ID_TO_ASCII, _last_cards_str,
                         _to_int, _bolt_marker)
@@ -38,6 +40,37 @@ from client import CHAR_TO_CARD
 # cur trick 77:185 | stats 185:191 | dealer 191:195 | last trick 195:339 |
 # BELIEF 339:435 | trick# 435:443 | mask 443:481 | graveyard 481:513
 BELIEF_SLICE = slice(339, 435)
+
+
+def verify_observation_patch(verbose=True):
+    """Confirm observation.py excludes known cards from every candidate row.
+
+    belot_sync pins declared and swapped cards with known_cards alone. On an
+    unpatched observation.py those pins leak ~0.49 onto each other opponent,
+    so the belief matrix would silently degrade instead of improving.
+    """
+    from env import BelotEnv
+    from observation import build_observation
+    e = BelotEnv()
+    e.phase = "PLAYING"; e.trump = 2; e.declarer = 1; e.dealer = 3
+    e.current_player = 0; e.done = False; e.tricks_played = 0
+    e.hands = [[0, 1, 2, 3]] + [list(range(4, 8)) for _ in range(3)]
+    e.graveyard = []; e.current_trick = []
+    e.known_cards[:] = False; e.impossible_cards[:] = False
+    e.known_cards[2, 20] = True
+    bel = build_observation(e, 0, [0, 0])[0][339:435].reshape(3, 32)
+    ok = bel[0, 20] == 0.0 and bel[2, 20] == 0.0
+    if not ok:
+        print("=" * 68)
+        print("[Audit][CRITICAL] observation.py is missing the known-card "
+              "exclusion.\n                  Pinned cards will leak "
+              f"{bel[0, 20]:.2f} of phantom mass onto each\n"
+              "                  other opponent. Update observation.py.")
+        print("=" * 68)
+    elif verbose:
+        print("[Audit] observation.py belief exclusion verified "
+              "(pins are exclusive).")
+    return ok
 
 
 class FrameRecorder:
@@ -69,7 +102,20 @@ class Auditor:
         self._points_cap_flagged = False
         self._hand_id = None
         self._short_hand = None
+        self._pending_special = None
+        self._combo_conflicts = 0
+        self._claim_syntax = set()
+        self._swap_seen = set()
+        self._in_swap_window = False
+        self._swap_windows = 0
+        self._swap_window_had_seven = False
+        self._last_top = ""
+        self._last_top_hand = None
+        self._swap_window_t0 = 0.0
+        self._swap_window_swapped = False
         self._combo_flagged = set()
+        self._declined_claims = {}
+        self._me = None
 
     # ------------------------------------------------------------------
     def _emit(self, kind, msg):
@@ -83,10 +129,12 @@ class Auditor:
         self.frame_no += 1
         # Reset per-hand state on the sync engine's own hand counter; the
         # leader chain does not survive a deal (live false positives).
+        self._me = sync.my_pos
         hid = getattr(sync, "hand_id", None)
         if hid != self._hand_id:
             self._hand_id = hid
             self._expected_leader = None
+            self._pending_special = None
             self._probed_last_cards = ""
             self._trick_log = []
             self._trump_bid_sampled = False
@@ -117,12 +165,35 @@ class Auditor:
         if my_hand & trick_cards and not scored:
             self._emit("VIOLATION", f"my hand ∩ trick: {my_hand & trick_cards}")
 
+        if getattr(sync, "combo_conflicts", 0) != self._combo_conflicts:
+            self._combo_conflicts = sync.combo_conflicts
+            self._emit("VIOLATION",
+                       "a declared combination decoded to a card in OUR hand "
+                       "-- combination decoding is wrong (see [Sync][ERROR])")
+
         for pidx in range(4):
             for card in ([] if scored else np.flatnonzero(env.known_cards[pidx])):
                 if int(card) in grave:
                     self._emit("VIOLATION",
                                f"known_cards ghost: seat {pidx} card "
                                f"{int(card)} already in graveyard")
+
+        # ---- training invariants ------------------------------------
+        # env transitions to PLAYING the instant a bid is accepted, so
+        # phase == "BIDDING" implies trump is None and declarer is None.
+        # The server does NOT honour this: it keeps the previous hand's
+        # values through the deal and bidding.
+        if env.phase == "BIDDING":
+            if env.trump is not None:
+                self._emit("VIOLATION",
+                           f"trump={env.trump} during BIDDING (training "
+                           f"guarantees None) -- stale server field leaking "
+                           f"into obs feature 3")
+            if env.declarer is not None:
+                self._emit("VIOLATION",
+                           f"declarer={env.declarer} during BIDDING "
+                           f"(training guarantees None) -- stale server "
+                           f"field leaking into obs feature 4")
 
         # ---- server cross-checks -------------------------------------
         if env.phase == "PLAYING" and not scored:
@@ -188,13 +259,26 @@ class Auditor:
         self._probe_score_columns(sync, raw_state)
         self._probe_points_semantics(sync, raw_state)
         self._probe_combo_flow(raw_state)
-        if (env.done and 0 < env.tricks_played < 8
+        self._probe_swap_window(sync, raw_state)
+        self._probe_top_card_rewrite(sync, raw_state)
+        sw = raw_state.get("swapSeven", -1)
+        if isinstance(sw, int) and sw >= 0 and (self._hand_id, sw) not in self._swap_seen:
+            self._swap_seen.add((self._hand_id, sw))
+            self._emit("PROBE",
+                       f"state swapSeven={sw} "
+                       + (f"-> reads as seat {sw}" if sw <= 3 else
+                          "-> OUT OF SEAT RANGE: field is not a seat index, "
+                          "the SWAP_SEVEN message is the only reliable source"))
+        if (env.done and env.tricks_played < 8
                 and self._short_hand != self._hand_id):
             self._short_hand = self._hand_id
-            self._emit('INFO',
-                       f'hand ended after {env.tricks_played} tricks '
-                       f'(WIN_ALL_HANDS claim) -- expected, no more '
-                       f'actions are taken in this hand')
+            src = (f"after {self._pending_special[0]} by seat "
+                   f"{self._pending_special[1]}" if self._pending_special
+                   else "with no announcement seen")
+            self._emit("INFO",
+                       f"hand ended early: {env.tricks_played}/8 tricks, "
+                       f"{len(env.graveyard)} cards in the graveyard, {src}. "
+                       f"No further actions are taken; the deal resets next.")
         # snapshot AFTER probes so the score probe sees the pre-reset value
         self._last_raw = list(env.raw_points_by_team)
         if env.phase == 'PLAYING':
@@ -297,6 +381,15 @@ class Auditor:
             prv, _ = sync._decode_score_table(st[:-1])
             deltas = [cur[0] - prv[0], cur[1] - prv[1]]
             _, rt = sync._parse_round_totals(raw_state)
+            if deltas == [0, 0]:
+                # LESS_THAN_14 voids the deal: the server appends a DUPLICATE
+                # cumulative row and leaves roundTotals on the previous hand,
+                # so comparing against b() here is meaningless.
+                self._emit("INFO",
+                           f"hand cancelled (LESS_THAN_14): duplicate score "
+                           f"row, totals stay ({cur[0]},{cur[1]})")
+                self._prev_score_rows = rows
+                return
             if rt is not None:
                 expect, tags = [], []
                 for t in (0, 1):
@@ -346,6 +439,198 @@ class Auditor:
             self._emit("PROBE",
                        f"hand scored: p({p0},{p1}) c({c0},{c1}) -> {verdict}")
         self._prev_rt_str = rt_str
+
+    def _probe_top_card_rewrite(self, sync, raw_state):
+        """After a swap the server rewrites topCard from the flipped card to
+        the 7 the declarer received. belot_sync freezes the pre-swap value;
+        this reports each rewrite so a change in that behaviour is visible."""
+        top = raw_state.get("topCard", "")
+        hid = getattr(sync, "hand_id", None)
+        if not top or (top == self._last_top and hid == self._last_top_hand):
+            return
+        # Only a rewrite WITHIN one hand is swap bookkeeping; a change across
+        # a hand boundary is simply the next deal's flipped card.
+        prev = self._last_top if hid == self._last_top_hand else ""
+        self._last_top, self._last_top_hand = top, hid
+        if prev and sync.env.face_up_card is not None:
+            frozen = ID_TO_ASCII.get(sync.env.face_up_card)
+            if top != frozen:
+                self._emit("PROBE",
+                           f"topCard rewritten '{prev}' -> '{top}' while the "
+                           f"face-up card stays frozen at '{frozen}' "
+                           f"(swap bookkeeping); swapSeven="
+                           f"{raw_state.get('swapSeven')}")
+
+    def _probe_swap_window(self, sync, raw_state):
+        """CONFIRMED: phase 8 opens after EVERY round-1 accept regardless of
+        whether anyone can swap, then waits on a timeout. So it carries no
+        per-player information and the eligibility test is purely local.
+
+        Two things are still worth measuring. (a) phase 8 must imply a
+        round-1 accept, i.e. trump == the face-up suit -- a violation would
+        break the swap bookkeeping. (b) how long the window actually stalls
+        when nobody swaps, which is the real cost of declining a swap
+        because the face-up card is going to our partner.
+        """
+        phase = raw_state.get("currentPhase")
+        env = sync.env
+        if phase != 8:
+            if self._in_swap_window and phase is not None and phase > 8:
+                self._in_swap_window = False
+                dt = time.time() - self._swap_window_t0
+                self._emit("INFO",
+                           f"phase 8 window #{self._swap_windows} closed after "
+                           f"{dt:.1f}s "
+                           + ("(a swap occurred)" if self._swap_window_swapped
+                              else ("(no swap; we did not hold the 7 of trump)"
+                                    if not self._swap_window_had_seven else
+                                    "(no swap; WE held the 7 -- either the "
+                                    "partner rule declined it or our "
+                                    "SWAP_SEVEN payload was not accepted)")))
+            return
+        if raw_state.get("swapSeven", -1) not in (-1, None):
+            self._swap_window_swapped = True
+        if env.trump is not None and sync.my_pos is not None:
+            if env.trump * 8 in env.hands[sync.my_pos]:
+                self._swap_window_had_seven = True
+        if self._in_swap_window:
+            return
+        self._in_swap_window = True
+        self._swap_windows += 1
+        self._swap_window_t0 = time.time()
+        self._swap_window_had_seven = False
+        self._swap_window_swapped = False
+
+        if env.face_up_card is not None and env.trump is not None:
+            if env.trump != env.face_up_card // 8:
+                self._emit("VIOLATION",
+                           f"phase 8 opened with trump {env.trump} != face-up "
+                           f"suit {env.face_up_card // 8}: phase 8 should only "
+                           f"follow a round-1 accept, and the swap "
+                           f"bookkeeping assumes it")
+        seven = env.trump * 8 if env.trump is not None else None
+        hold = (seven is not None and sync.my_pos is not None
+                and seven in env.hands[sync.my_pos])
+        self._emit("PROBE",
+                   f"phase 8 window #{self._swap_windows}: face-up="
+                   f"{ID_TO_ASCII.get(env.face_up_card)} declarer="
+                   f"{env.declarer} | "
+                   + ("the face-up card IS the 7 of trump -- no swap is "
+                      "possible for anyone this hand"
+                      if seven is not None and seven == env.face_up_card else
+                      f"we {'HOLD' if hold else 'do NOT hold'} the 7 of "
+                      f"trump ({ID_TO_ASCII.get(seven)})"))
+
+    def note_special(self, msg_type, data):
+        """Hand-altering server events. None of them need special handling in
+        the sync layer -- what matters is that the hand ends or is cancelled
+        cleanly -- but they change what the following frames MEAN, so they are
+        recorded and correlated with the phase path the hand actually took."""
+        who = data.get("who") if isinstance(data, dict) else None
+        effect = {
+            "LESS_THAN_14":  "deal CANCELLED, scoreboard unchanged",
+            "FOUR_OF_SEVEN": "deal CANCELLED (four 7s), scoreboard unchanged",
+            "FOUR_OF_EIGHT": "combinations DISABLED except bella; hand continues",
+            "WIN_ALL_HANDS": "fast-forward: claimant takes every remaining "
+                             "trick, points DO score",
+            "SURRENDER_BT":  "fast-forward: claimant concedes and takes a "
+                             "bolt, points DO score",
+            "BIZON":         "forced trump; bidding and the swap window are "
+                             "skipped",
+        }.get(msg_type, "unknown effect")
+        self._pending_special = (msg_type, who)
+        self._emit("INFO", f"{msg_type} by seat {who} -- {effect}")
+
+    def note_combination(self, seat, value, source):
+        """Record a declaration and check the wire syntax of the non-card
+        claim types, whose trailing char is believed to be a filler 'a'."""
+        for type_id, ch in combo.parse_field(value or ""):
+            if type_id in combo.CLAIM_COMBOS:
+                key = (type_id, ch)
+                if key in self._claim_syntax:
+                    continue
+                self._claim_syntax.add(key)
+                name = combo.TYPE_NAMES.get(type_id, str(type_id))
+                verdict = ("filler 'a' as expected"
+                           if ch == combo.CLAIM_FILLER else
+                           f"trailing char is '{ch}', NOT 'a' -- our outgoing "
+                           f"token {combo.claim_token(type_id)} may be wrong")
+                self._emit("PROBE",
+                           f"claim declaration {type_id}{ch} ({name}) via "
+                           f"{source}, seat {seat}: {verdict}")
+
+    def _probe_combo_flow(self, raw_state):
+        """Report what the server offers OUR seat, once per hand per value.
+
+        Point combinations plus LESS_THAN_14 and BELOT_COMBO are declared
+        automatically; WIN_ALL_HANDS and SURRENDER_BT are declined by policy.
+        The declines are counted, because WIN_ALL_HANDS is a claim on every
+        remaining trick and how often it is offered is worth knowing.
+        """
+        for i, p in enumerate(raw_state.get("players", [])):
+            for field in ("combinationsCanShow", "combinations"):
+                self.note_combination(i, p.get(field), f"state.{field}")
+            v = p.get("combinationsCanShow") or ""
+            if not v or i != self._me:
+                continue
+            key = (self._hand_id, v)
+            if key in self._combo_flagged:
+                continue
+            self._combo_flagged.add(key)
+            # Mirror the agent's own policy so the preview cannot
+            # disagree with what is actually sent.
+            declared = combo.declarable(v, ASCII_TO_ID)
+            declined = [f"{t}{c}" for t, c in combo.parse_field(v)
+                        if t in combo.NEVER_DECLARE]
+            note = f"offered '{v}'"
+            if declared:
+                note += f" -> declaring {declared}"
+            for tok in declined:
+                self._declined_claims[tok] = self._declined_claims.get(tok, 0) + 1
+            if declined:
+                names = [combo.TYPE_NAMES.get(int(t[:-1]), t) for t in declined]
+                note += (f" -> DECLINING {declined} ({', '.join(names)}) by "
+                         f"policy; {sum(self._declined_claims.values())} such "
+                         f"offers declined so far")
+            self._emit("PROBE", note)
+
+    def note_special(self, msg_type, data):
+        """Hand-altering server events. None of them need special handling in
+        the sync layer -- what matters is that the hand ends or is cancelled
+        cleanly -- but they change what the following frames MEAN, so they are
+        recorded and correlated with the phase path the hand actually took."""
+        who = data.get("who") if isinstance(data, dict) else None
+        effect = {
+            "LESS_THAN_14":  "deal CANCELLED, scoreboard unchanged",
+            "FOUR_OF_SEVEN": "deal CANCELLED (four 7s), scoreboard unchanged",
+            "FOUR_OF_EIGHT": "combinations DISABLED except bella; hand continues",
+            "WIN_ALL_HANDS": "fast-forward: claimant takes every remaining "
+                             "trick, points DO score",
+            "SURRENDER_BT":  "fast-forward: claimant concedes and takes a "
+                             "bolt, points DO score",
+            "BIZON":         "forced trump; bidding and the swap window are "
+                             "skipped",
+        }.get(msg_type, "unknown effect")
+        self._pending_special = (msg_type, who)
+        self._emit("INFO", f"{msg_type} by seat {who} -- {effect}")
+
+    def note_combination(self, seat, value, source):
+        """Record a declaration and check the wire syntax of the non-card
+        claim types, whose trailing char is believed to be a filler 'a'."""
+        for type_id, ch in combo.parse_field(value or ""):
+            if type_id in combo.CLAIM_COMBOS:
+                key = (type_id, ch)
+                if key in self._claim_syntax:
+                    continue
+                self._claim_syntax.add(key)
+                name = combo.TYPE_NAMES.get(type_id, str(type_id))
+                verdict = ("filler 'a' as expected"
+                           if ch == combo.CLAIM_FILLER else
+                           f"trailing char is '{ch}', NOT 'a' -- our outgoing "
+                           f"token {combo.claim_token(type_id)} may be wrong")
+                self._emit("PROBE",
+                           f"claim declaration {type_id}{ch} ({name}) via "
+                           f"{source}, seat {seat}: {verdict}")
 
     def _probe_combo_flow(self, raw_state):
         for i, p in enumerate(raw_state.get("players", [])):

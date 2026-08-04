@@ -1,6 +1,7 @@
 import json
 import re
 import numpy as np
+import combinations as combo
 from env import BelotEnv
 
 ASCII_TO_ID = {
@@ -12,9 +13,15 @@ ASCII_TO_ID = {
 
 ID_TO_ASCII = {v: k for k, v in ASCII_TO_ID.items()}
 
-DEAL_PHASES = (0, 1, 2, 3, 4, 5)   # ready / cut / deal
-BID_PHASES  = (6, 7)               # bidding round 1 / round 2
-END_PHASES  = (13, 14)             # hand scored / finished
+# Authoritative phase enum (gameplay.js):
+#  0 NOT_STARTED  1 STARTED   2 PUSH_CARDS  3 AFTER_PUSH_CARD
+#  4 ANIMATION_FIRST_DEAL     5 DEAL_CARDS_1
+#  6 TRUMP_CHOOSE_1  7 TRUMP_CHOOSE_2  8 SWAP_SEVEN  9 DEAL_CARDS_2
+# 10 PLAY  11 HAND_TAKE  12 WIN_ALL_HANDS  13 ROUND_ENDED  14 GAME_ENDED
+DEAL_PHASES  = (0, 1, 2, 3, 4, 5)  # ready / cut / first deal
+BID_PHASES   = (6, 7)              # bidding round 1 / round 2
+SWAP_PHASE   = 8                   # seven-swap window (round-1 accept only)
+END_PHASES   = (13, 14)            # hand scored / match finished
 
 
 _BOLT_RE = re.compile(r"^\s*BT[-_ ]?(\d+)\s*$", re.IGNORECASE)
@@ -70,7 +77,6 @@ class StateSynchronizer:
         # Force a clean shadow-reset on the first actionable frame
         # (cold start AND the bridge.js mid-hand rejoin path).
         self._pending_reset = True
-        self._swap_warned = False
         self._new_hand_event = False
         # Leader chain: first trick led by the declarer, every later trick by
         # the previous trick's winner. Lets us rebuild chronological order
@@ -80,12 +86,16 @@ class StateSynchronizer:
         # `round` increments at the deal (observed 13->2 with round n->n+1),
         # making it a far more reliable hand boundary than phase edges.
         self._synced_round = None
-        self._reset_for_round = object()   # sentinel: never equal to a round
+        self._sentinel = object()          # never equal to any round value
+        self._reset_for_round = self._sentinel
         self.hand_id = 0                   # non-consuming hand counter
         # declarer_has_played_trump derived locally (server field observed
         # stale across hand boundaries).
         self._declarer_trump_seen = False
         self._score_anomaly_logged = False
+        self._applied_combos = set()    # (seat, value) already folded in
+        self._swap = None          # (who, seven_id, top_id) once a swap is seen
+        self.combo_conflicts = 0        # decoded card found in OUR hand
         # True while playing out a hand we joined mid-way (past tricks are
         # unrecoverable). The auditor downgrades conservation violations to
         # INFO while this is set. Cleared at the next clean deal.
@@ -139,7 +149,12 @@ class StateSynchronizer:
         # from the previous hand, so it can't be replayed into the fresh
         # graveyard / tricks_played counter on this same frame.
         self._known_last_cards_str = _last_cards_str(raw_state)
-        self._swap_warned = False
+        # Per-hand belief bookkeeping. Leaving _swap set was what froze
+        # face_up_card on the previous hand's card; leaving _applied_combos
+        # set silently dropped a declaration whose (seat, value) had already
+        # been seen in an earlier hand.
+        self._swap = None
+        self._applied_combos = set()
         self._new_hand_event = True
         self.hand_id += 1
         self._next_leader = None
@@ -215,6 +230,117 @@ class StateSynchronizer:
             if seat == self.env.declarer and card // 8 == self.env.trump:
                 self._declarer_trump_seen = True
 
+    # ------------------------------------------------------------------ pinning
+    def _pin_known(self, seat, card, exclusive=True):
+        """Mark `card` as certainly held by `seat`. With `exclusive`, first
+        clear the column so no stale holder survives (used by the seven-swap,
+        where a card genuinely changes hands mid-deal)."""
+        if seat is None or not (0 <= seat <= 3) or card is None:
+            return False
+        if card in self.env.graveyard:
+            return False
+        if any(c == card for _, c in self.env.current_trick):
+            return False
+        if (self.my_pos is not None and seat != self.my_pos
+                and card in self.env.hands[self.my_pos]):
+            return False            # it is in OUR hand: the claim is wrong
+        if exclusive:
+            self.env.known_cards[:, card] = False
+        self.env.known_cards[seat, card] = True
+        return True
+
+    def apply_seven_swap(self, who, seven, top):
+        """A player traded the 7 of trump for the face-up card.
+
+        Server message: SWAP_SEVEN {who, swappedCard, topCard}. Afterwards
+        `who` holds the face-up card and the card's previous holder -- the
+        natural recipient, i.e. the declarer in a round-1 accept -- holds the
+        7. Both are certainties, so both are pinned, and the pins are
+        exclusive because ownership actually moved.
+
+        Covers every case symmetrically: we swap with someone, someone swaps
+        with us, or two opponents swap. Our own hand is resynced from the
+        server either way; what needs inferring is the other side of the
+        trade.
+        """
+        if who is None or not (0 <= who <= 3):
+            return
+        if seven is None and self.env.trump is not None:
+            seven = self.env.trump * 8                 # rank 0 == the 7
+        if top is None:
+            top = self.env.face_up_card
+        if seven is None or top is None or seven == top:
+            return
+
+        natural = self._natural_face_up_recipient()
+        self._swap = (who, seven, top)
+        self._pin_known(who, top)
+        if natural is not None and natural != who:
+            self._pin_known(natural, seven)
+        print(f"[Sync] seven-swap: seat {who} took {ID_TO_ASCII.get(top)} "
+              f"(face-up), seat {natural} received "
+              f"{ID_TO_ASCII.get(seven)} (7 of trump)")
+
+    def _natural_face_up_recipient(self):
+        """Who would hold the face-up card with no swap: the declarer when it
+        was accepted in round 1, otherwise the dealer."""
+        if self.env.face_up_card is None or self.env.trump is None:
+            return None
+        if self.env.trump == self.env.face_up_card // 8:
+            return self.env.declarer
+        return self.env.dealer
+
+    # ------------------------------------------------------------------ combos
+    def apply_combination(self, seat, value):
+        """Fold a declared combination into the belief state.
+
+        Uses known_cards, the same channel and the same 1.0 semantics the
+        face-up card uses in training. observation.py now excludes every
+        known card from all three candidate rows, so one pin is enough: the
+        holder reads 1.0 and the other two read 0.0, with the column summing
+        to exactly 1.0. (Before that fix a pin leaked ~0.49 onto each other
+        opponent, so five declared cards misallocated ~37% of their mass.)
+        """
+        if seat is None or seat < 0 or not value:
+            return
+        key = (seat, value)
+        if key in self._applied_combos:
+            return
+        self._applied_combos.add(key)
+
+        cards, unknown = combo.decode_field(value, ASCII_TO_ID)
+        for type_id, ch in unknown:
+            print(f"[Sync][WARN] unrecognised combination type {type_id} "
+                  f"('{type_id}{ch}') from seat {seat}: ignored")
+        if not cards:
+            return
+
+        # Self-check: a decoded card sitting in OUR hand proves the decoding
+        # is wrong. Writing a false 1.0 into the belief matrix is far worse
+        # than ignoring the declaration, so drop the whole thing.
+        if seat == self.my_pos:
+            return          # our own declaration echoed back: nothing to learn
+        mine = set(self.env.hands[self.my_pos]) if self.my_pos is not None else set()
+        clash = [c for c in cards if c in mine]
+        if clash:
+            self.combo_conflicts += 1
+            print(f"[Sync][ERROR] combination '{value}' from seat {seat} "
+                  f"decodes to cards {clash} that are in OUR hand -- "
+                  f"decoding is wrong, declaration ignored")
+            return
+
+        gone = set(self.env.graveyard) | {c for _, c in self.env.current_trick}
+        applied = [c for c in cards if c not in gone]
+        applied = [c for c in applied if self._pin_known(seat, c, exclusive=False)]
+        dropped = [c for c in cards if c not in applied]
+        if dropped:
+            print(f"[Sync] seat {seat} '{value}': "
+                  f"{[ID_TO_ASCII[c] for c in dropped]} already played, "
+                  f"not pinned")
+        if applied:
+            print(f"[Sync] seat {seat} declared '{value}' -> "
+                  f"{[ID_TO_ASCII[c] for c in applied]} pinned in belief state")
+
     # ------------------------------------------------------------------ beliefs
     def _mark_voids(self, trick):
         """Exact mirror of env._handle_playing_action's inference, applied
@@ -267,6 +393,20 @@ class StateSynchronizer:
         if round_changed or ((phase in DEAL_PHASES or phase in END_PHASES) and edge):
             self._pending_reset = True
 
+        # A hand can be ABORTED at any point: LESS_THAN_14 and FOUR_OF_SEVEN
+        # both cancel the deal outright, dropping the phase straight back to
+        # the deal (10 -> 1 -> 2 observed live) while the server appends a
+        # duplicate scoreTable row. The abort can equally fire during bidding
+        # or the swap window, so ANY entry into a deal phase from a live one
+        # counts. `round` happened to increment every observed time, but
+        # nothing guarantees it, and a reused round number would let the
+        # guard below suppress the reset and leak the aborted hand's
+        # graveyard, trick count and beliefs into the fresh deal.
+        if (phase in DEAL_PHASES and prev_phase not in DEAL_PHASES
+                and prev_phase not in END_PHASES):
+            self._pending_reset = True
+            self._reset_for_round = self._sentinel
+
         entering_bidding = phase in BID_PHASES and prev_phase not in BID_PHASES
         may_reset = (phase not in END_PHASES and phase != 0
                      and (cur_round is None or cur_round != self._reset_for_round))
@@ -294,48 +434,84 @@ class StateSynchronizer:
         self.env.dealer = raw_state.get("dealer", 0)
         self.env.current_player = raw_state.get("activePlayer", 0)
 
+        # LIVE-OBSERVED: `trump` and `declarer` carry the PREVIOUS hand's
+        # values right through the deal and bidding, only updating when a bid
+        # is accepted (phase 6 showed trump=2/declarer=0 from the last round,
+        # flipping to trump=4/declarer=3 at phase 8). Training guarantees the
+        # opposite invariant -- env transitions to PLAYING the instant a bid
+        # lands, so phase == "BIDDING" always implies trump is None and
+        # declarer is None. Taken literally the server values put a phantom
+        # trump in obs feature 3 and a phantom declarer in feature 4 for
+        # every bidding decision, so they are suppressed until the deal and
+        # bidding are over.
         declarer = raw_state.get("declarer", None)
-        self.env.declarer = declarer if (declarer is not None and declarer >= 0) else None
+        bidding_open = phase in DEAL_PHASES or phase in BID_PHASES
+        self.env.declarer = (None if bidding_open
+                             else (declarer if (declarer is not None and declarer >= 0)
+                                   else None))
 
         # Server flag kept only as a degraded-mode fallback (see
         # _track_declarer_trump). Primary source is our own trick history.
         self._server_trump_flag = bool(raw_state.get("trumpWasPlayed", False))
 
         trump_val = raw_state.get("trump", -1)
-        self.env.trump = (trump_val - 1) if 1 <= trump_val <= 4 else None
+        self.env.trump = (None if bidding_open
+                          else ((trump_val - 1) if 1 <= trump_val <= 4 else None))
 
+        # LIVE-OBSERVED: `topCard` is stale from the previous hand until the
+        # deal completes, AND it changes meaning after a seven-swap -- the
+        # server rewrites it from the flipped card to the 7 the declarer
+        # received (observed "v" -> "E"). Keep following it until a swap is
+        # seen, then freeze: everything downstream (bidding legality, the
+        # face-up observation feature, the swap's own bookkeeping) needs the
+        # ORIGINAL flipped card. The rewritten value is recoverable anyway,
+        # since the 7 of trump is just trump * 8.
         top_card_char = raw_state.get("topCard", "")
-        if top_card_char in ASCII_TO_ID:
-            self.env.face_up_card = ASCII_TO_ID[top_card_char]
-            self.env.face_up_suit = self.env.face_up_card // 8
+        swap_seat = raw_state.get("swapSeven", -1)
+        top_id = ASCII_TO_ID.get(top_card_char)
+        if top_id is not None:
+            if phase < SWAP_PHASE:
+                # Deal and bidding: follow the server. topCard is stale from
+                # the previous hand for the first frames, but it settles at
+                # the real flipped card by the time cards are dealt (phase 5)
+                # and long before we ever act (phase 6).
+                self.env.face_up_card = top_id
+                self.env.face_up_suit = top_id // 8
+            elif self.env.face_up_card is None:
+                # Joined mid-hand: adopt whatever is there. If a swap already
+                # happened this is the 7, not the flipped card -- degraded,
+                # and flagged as such.
+                self.env.face_up_card = top_id
+                self.env.face_up_suit = top_id // 8
+            # From phase 8 on the value is FROZEN. A swap makes the server
+            # rewrite topCard to the 7 the declarer received, and everything
+            # downstream (bidding legality, the face-up feature, the swap
+            # bookkeeping) needs the ORIGINAL flipped card.
 
-        # known_cards: face-up recipient, edge-triggered on entry into play.
-        # (prev in END_PHASES covers a dropped-bidding jump 14 -> 10.)
-        # NOT re-run every frame: the flag is cleared once the card is played
-        # and must never be resurrected.
-        if (phase >= 10 and not self.env.done
-                and (prev_phase < 10 or prev_phase in END_PHASES)):
-            if top_card_char in ASCII_TO_ID and self.env.trump is not None:
-                top_id = ASCII_TO_ID[top_card_char]
-                if self.env.trump == top_id // 8:
-                    recipient = self.env.declarer          # accepted in round 1
-                else:
-                    recipient = raw_state.get("dealer", None)  # round-2 pick
-                if recipient is not None and recipient >= 0:
-                    self.env.known_cards[recipient, top_id] = True
-            # Anchor the leader chain: the declarer leads the first trick.
-            if self._next_leader is None and self.env.declarer is not None:
-                self._next_leader = self.env.declarer
+        # Seven-swap fallback: the SWAP_SEVEN broadcast is the primary
+        # source (bot_agent forwards it), but a dropped message would lose
+        # the information, so the state field is honoured too. Both the
+        # swapped card (7 of trump) and the taken card (face-up) are
+        # derivable from `who` alone.
+        # LIVE-CONFIRMED: swapSeven is the SEAT INDEX of the player who
+        # swapped (-1 when nobody did). Primary source is the SWAP_SEVEN
+        # broadcast; this recovers the information if that message is lost.
+        # Gated on phase >= 8: like trump, declarer and topCard, swapSeven
+        # carries the PREVIOUS hand's value through the deal. Honouring it
+        # early re-armed the swap right after the reset, which then froze
+        # face_up_card on the stale topCard for the whole hand -- corrupting
+        # bidding legality (an illegal suit pick that the server rejected
+        # until our turn timed out), the phase-8 checks, and the belief pins.
+        if (phase >= SWAP_PHASE and phase not in END_PHASES
+                and isinstance(swap_seat, int) and 0 <= swap_seat <= 3
+                and self._swap is None):
+            self.apply_seven_swap(swap_seat, None, None)
 
-        # swapSeven: unmodeled platform feature (trump-7 exchange). If it ever
-        # fires, the face-up card's ownership is no longer what our inference
-        # says -> neutralize the known flag rather than assert a wrong one.
-        swap = raw_state.get("swapSeven", -1)
-        if swap is not None and swap >= 0 and self.env.face_up_card is not None:
-            if not self._swap_warned:
-                print("[Sync][WARN] swapSeven active; clearing face-up known_cards.")
-                self._swap_warned = True
-            self.env.known_cards[:, self.env.face_up_card] = False
+        # Deferred to section 6b: the pin guard compares candidate cards
+        # against our own hand, which is only accurate after the hands have
+        # been resynced (a swap changes our hand in the very same frame).
+        entered_play = (phase >= 10 and not self.env.done
+                        and (prev_phase < 10 or prev_phase in END_PHASES))
 
         # 4. Trick reconstruction (per-seat merge; wipe/bundle-safe) --------
         # cardPlayed/cardOrder are ABSENT for players yet to act; cardOrder is
@@ -466,6 +642,52 @@ class StateSynchronizer:
                     else:
                         n = 0
                 self.env.hands[i] = list(range(max(0, int(n))))  # dummy ids
+
+        # known_cards: face-up recipient, edge-triggered on entry into play.
+        # (prev in END_PHASES covers a dropped-bidding jump 14 -> 10.)
+        # NOT re-run every frame: the flag is cleared once the card is played
+        # and must never be resurrected.
+        if entered_play:
+            top_id = ASCII_TO_ID.get(top_card_char)
+            natural = self._natural_face_up_recipient()
+            if top_id is not None:
+                if self._swap is not None:
+                    who, seven, top = self._swap
+                    self._pin_known(who, top)
+                    if natural is not None and natural != who:
+                        self._pin_known(natural, seven)
+                elif (self.my_pos is not None
+                      and top_id in self.env.hands[self.my_pos]
+                      and self.env.trump == top_id // 8):
+                    # Round-1 accept only: phase 8 (and therefore any swap)
+                    # exists solely on that path, so a round-2 pick can never
+                    # be mistaken for a swap just because we happen to hold
+                    # the flipped card.
+                    if natural != self.my_pos:
+                        self.apply_seven_swap(self.my_pos, None, top_id)
+                    else:
+                        self._pin_known(self.my_pos, top_id)
+                elif natural == self.my_pos and self.env.trump is not None \
+                        and self.env.trump * 8 in self.env.hands[self.my_pos]:
+                    # We were the natural recipient but hold the 7 instead:
+                    # someone swapped with us. We cannot see who, so assert
+                    # nothing about the face-up card rather than guess.
+                    print("[Sync] seven-swap: an opponent took the face-up "
+                          "card from us; holder unknown, left unpinned")
+                else:
+                    self._pin_known(natural, top_id)
+            # Anchor the leader chain: the declarer leads the first trick.
+            if self._next_leader is None and self.env.declarer is not None:
+                self._next_leader = self.env.declarer
+
+        # 6b. Declared combinations ------------------------------------------
+        # Sourced from the per-player `combinations` field so a dropped
+        # SHOW_COMBINATION message cannot lose the information; bot_agent
+        # also forwards the live messages. Both paths are deduplicated.
+        for i, p in enumerate(players):
+            declared = p.get("combinations") or ""
+            if declared and i != self.my_pos:
+                self.apply_combination(i, declared)
 
         # 7. Match scores + bolts -------------------------------------------
         # scoreTable rows are CUMULATIVE (row deltas == roundTotals.b) and

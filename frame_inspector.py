@@ -98,27 +98,62 @@ def main(path="frames.jsonl"):
     if not anomalies:
         print("  all cells numeric in this recording")
 
-    # ---------------- 2. trumpWasPlayed staleness -------------------------
-    h("2. trumpWasPlayed  (stale across hands?)")
-    prev_phase, rows = None, []
+    # ---------------- 2. stale trump / declarer during bidding -----------
+    h("2. trump / declarer staleness through the deal and bidding")
+    stale = fresh = 0
     for i, r in enumerate(recs):
         st = r["state"]
-        ph, flag = st.get("currentPhase"), st.get("trumpWasPlayed")
-        if ph in (6, 7) and prev_phase not in (6, 7):
-            rows.append((i, "hand start (BIDDING)", flag))
-        elif prev_phase is not None and flag != prev_flag:
-            rows.append((i, f"flip in phase {ph}", flag))
-        prev_phase, prev_flag = ph, flag
-    for i, what, flag in rows[:30]:
-        print(f"  f{i:>4} {what:<26} trumpWasPlayed={flag}")
-    bid_true = [x for x in rows if "BIDDING" in x[1] and x[2]]
-    if bid_true:
-        print(f"\n  *** VERDICT: True during BIDDING in {len(bid_true)} hand(s) "
-              f"-> field is STALE; local derivation is required (now in use).")
-    elif any("BIDDING" in x[1] for x in rows):
-        print("\n  VERDICT: False at every hand start -> field resets correctly.")
+        ph = st.get("currentPhase")
+        if ph not in (2, 3, 4, 5, 6, 7):
+            continue
+        t, d = st.get("trump", -1), st.get("declarer", -1)
+        if (isinstance(t, int) and 1 <= t <= 4) or (isinstance(d, int) and d >= 0):
+            stale += 1
+            if stale <= 3:
+                print(f"  f{i:>4} phase {ph}: trump={t} declarer={d} "
+                      f"(training guarantees BOTH unset while bidding)")
+        else:
+            fresh += 1
+    print(f"  {stale} deal/bidding frames carry a trump or declarer, "
+          f"{fresh} do not")
+    if stale:
+        print("  -> CONFIRMED stale. belot_sync suppresses both until phase 8+,\n"
+              "     otherwise obs features 3 and 4 are wrong for every bid.")
 
-    # ---------------- 3. lastCards seat-index validation ------------------
+    # ---------------- 2b. topCard rewritten by a swap --------------------
+    h("2b. topCard rewrite (seven-swap bookkeeping)")
+    prev_top, prev_round, hits = None, None, 0
+    for i, r in enumerate(recs):
+        st = r["state"]
+        top, rnd = st.get("topCard", ""), st.get("round")
+        if rnd == prev_round and top and prev_top and top != prev_top:
+            sw = st.get("swapSeven", -1)
+            hits += 1
+            print(f"  f{i:>4} round {rnd}: topCard '{prev_top}' -> '{top}' "
+                  f"with swapSeven={sw} (phase {st.get('currentPhase')})")
+        if top:
+            prev_top = top
+        prev_round = rnd
+    if not hits:
+        print("  no mid-hand rewrite in this recording")
+    else:
+        print("  -> the flipped card is replaced by the 7 the declarer got;\n"
+              "     belot_sync freezes the pre-swap value.")
+
+    # ---------------- 2c. swapSeven semantics ----------------------------
+    h("2c. swapSeven field")
+    vals = Counter()
+    for r in recs:
+        v = r["state"].get("swapSeven", -1)
+        vals[v] += 1
+    print(f"  observed values: {dict(vals)}")
+    bad = [v for v in vals if not isinstance(v, int) or v < -1 or v > 3]
+    if bad:
+        print(f"  *** values outside seat range: {bad} -- NOT a seat index!")
+    else:
+        print("  all values are -1 or a valid seat index (0-3), "
+              "consistent with 'seat that swapped'")
+
     h("3. lastCards vs table cards  (seat-indexing holds?)")
     # The server wipes the table in the same frame it publishes lastCards, so
     # compare against the LAST SEEN table rather than the current one.
@@ -180,6 +215,30 @@ def main(path="frames.jsonl"):
                           f"final trick + pasledu land after the last "
                           f"PLAYING frame — expected)")
         prev_rt = key
+
+    # ---------------- 4b. cancelled hands (LESS_THAN_14) -----------------
+    h("4b. cancelled hands (LESS_THAN_14 voids the deal)")
+    prev_rows, dup = None, 0
+    for i, r in enumerate(recs):
+        st = r["state"]
+        tbl = jparse(st.get("scoreTable", "[]"), [])
+        if not isinstance(tbl, list) or not tbl:
+            continue
+        n = len(tbl)
+        if prev_rows is not None and n == prev_rows + 1 and n >= 2:
+            a, b = tbl[-2], tbl[-1]
+            if isinstance(a, list) and isinstance(b, list) and a == b:
+                dup += 1
+                print(f"  f{i:>4} round {st.get('round')}: duplicate row {b} "
+                      f"-> hand voided, match score unchanged")
+        prev_rows = n
+    if dup:
+        print(f"\n  {dup} cancelled hand(s). The server appends a duplicate")
+        print("  cumulative row and leaves roundTotals on the PREVIOUS hand,")
+        print("  so a b() comparison there is meaningless. belot_sync forces a")
+        print("  reset on the 10 -> 1 abort even if `round` is reused.")
+    else:
+        print("  none in this recording")
 
     # ---------------- 5. combinations -------------------------------------
     h("5. combination fields  (does the bot ever need to respond?)")

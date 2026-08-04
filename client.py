@@ -81,6 +81,20 @@ class BelotClient:
     async def play_card_char(self, card_char: str):
         await self._send("PLAY_CARD", card_char)
 
+    async def swap_seven(self):
+        """Phase 8 (SWAP_SEVEN): exchange our 7 of trump for the face-up card.
+
+        Payload mirrors PASS -- an empty object, msgpack 0x80. A captured
+        outgoing frame reads
+
+            0x0d ROOM_DATA | 0xAA fixstr(10) "SWAP_SEVEN" | <one byte>
+
+        and exactly one trailing byte rules out a card char (a1 45), an
+        object (81 ab ...) and an omitted payload (no byte at all). The card
+        is not sent: the server already knows who holds the 7.
+        """
+        await self._send("SWAP_SEVEN", {})
+
     async def show_combination(self, value: str):
         """Announce a declaration. Payload shape mirrors PLAY_CARD /
         TRUMP_CHOOSE, which both send a bare scalar; the server broadcasts

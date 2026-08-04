@@ -96,6 +96,12 @@ def build_observation(belot, abs_id, match_scores):
         unseen[c] = False
     if belot.phase == "BIDDING" and belot.face_up_card is not None:
         unseen[belot.face_up_card] = False
+    # A card known to sit in one specific hand is not an open candidate for
+    # anybody else. Without this line the holder gets belief 1.0 (set below)
+    # while the other two opponents still receive ~0.49 of phantom mass on
+    # the same card -- the column sums to ~1.97 instead of 1.0 -- and their
+    # genuine candidates are diluted to compensate.
+    unseen[belot.known_cards.any(axis=0)] = False
 
     other_players = [(abs_id + 1) % 4, (abs_id + 2) % 4, (abs_id + 3) % 4]
 
