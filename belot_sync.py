@@ -420,6 +420,11 @@ class StateSynchronizer:
             self._reset_for_round = cur_round
             self.degraded_hand = joined_mid
 
+        if phase in BID_PHASES and self.env.face_up_card is None:
+            print("[Sync][CRITICAL] entered bidding with no face-up card "
+                  f"(topCard={raw_state.get('topCard')!r}); the round-2 suit "
+                  "mask cannot exclude the flipped suit")
+
         # Phase mapping
         if phase in BID_PHASES:
             self.env.phase = "BIDDING"
@@ -567,7 +572,18 @@ class StateSynchronizer:
                 self.env.last_trick = [(seat, card) for _, seat, card in finished]
                 self.last_trick_source = "partial"
 
-            self._mark_voids(self.env.last_trick)   # backstop for dropped frames
+            # Void inference reads trick[0] as the LEADER. On the "partial"
+            # path the order is not trustworthy, so marking voids there
+            # attributes the wrong suits to the wrong seat -- and
+            # impossible_cards is never re-derived, so it poisons the belief
+            # matrix for the rest of the hand. Only the two ordered paths
+            # feed it. (_track_declarer_trump is order-independent.)
+            if self.last_trick_source in ("cardOrder", "seatIndex"):
+                self._mark_voids(self.env.last_trick)
+            elif self.env.last_trick:
+                print("[Sync][WARN] last trick reconstructed from partial "
+                      "evidence; skipping void inference to avoid poisoning "
+                      "the belief state")
             self._track_declarer_trump(self.env.last_trick)
 
             # Chain the leader for the next trick.
@@ -643,6 +659,22 @@ class StateSynchronizer:
                         n = 0
                 self.env.hands[i] = list(range(max(0, int(n))))  # dummy ids
 
+        # A seat cannot hold more certainties than cards. This goes wrong when
+        # a whole trick's frames are lost: pins are only cleared for cards seen
+        # in `lastCards` or on the live table, so a pinned card that was
+        # actually played stays pinned while numCards shrinks. The row then
+        # carries more belief mass than the hand can hold. At least one pin is
+        # provably wrong and we cannot tell which, so drop them all -- a false
+        # 1.0 is worse than no pin (same rule apply_combination follows).
+        for i in range(4):
+            n_pins = int(self.env.known_cards[i].sum())
+            if n_pins > len(self.env.hands[i]):
+                print(f"[Sync][WARN] seat {i} has {n_pins} pinned cards but "
+                      f"only {len(self.env.hands[i])} in hand (dropped trick "
+                      f"frames?); clearing its pins rather than feeding the "
+                      f"model a contradiction")
+                self.env.known_cards[i, :] = False
+
         # known_cards: face-up recipient, edge-triggered on entry into play.
         # (prev in END_PHASES covers a dropped-bidding jump 14 -> 10.)
         # NOT re-run every frame: the flag is cleared once the card is played
@@ -705,8 +737,12 @@ class StateSynchronizer:
                 scores, bolts = self._decode_score_table(score_table)
                 self.match_scores = scores
                 self.env.bolts_by_team = bolts
-        except Exception:
-            pass
+        except Exception as exc:
+            if not self._score_anomaly_logged:
+                self._score_anomaly_logged = True
+                print(f"[Sync][WARN] scoreTable parse failed "
+                      f"({type(exc).__name__}: {exc}); match_scores held at "
+                      f"{self.match_scores}")
 
         # 8. Live raw points -------------------------------------------------
         # Payload-confirmed: roundTotals.p is the PREVIOUS round's summary

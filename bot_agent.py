@@ -69,8 +69,8 @@ class LiveBelotBot:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = RecurrentMAPPOModel().to(self.device)
 
-        found = next((p for p in [model_path] + MODEL_SEARCH
-                      if p and os.path.exists(p)), None)
+        candidates = [model_path] + [p for p in MODEL_SEARCH if p != model_path]
+        found = next((p for p in candidates if p and os.path.exists(p)), None)
         if found:
             checkpoint = torch.load(found, map_location=self.device)
             self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -92,6 +92,11 @@ class LiveBelotBot:
         # bot forever if the server ever rejected an action)
         self.last_action_turn_id = None
         self.last_dispatch_ts = 0.0
+        # (turn_id, hidden_state_before_this_turn, {actions already refused})
+        # Keeps the recurrent state advancing once per DECISION rather than
+        # once per DISPATCH, and blocks a refused action on re-dispatch
+        # (PLATFORM_NOTES §12).
+        self._turn_decision = None
         self._ready_sent_phase = None
         self._declared = set()          # (hand_id, value) already announced
         self._pending_play = None     # (hand_id, trick_no, card) in flight
@@ -195,7 +200,7 @@ class LiveBelotBot:
             self.last_action_turn_id = turn_id
             self.last_dispatch_ts = now
 
-            await self._select_and_execute_action(my_pos)
+            await self._select_and_execute_action(my_pos, turn_id)
 
     async def _check_play_accepted(self, my_pos):
         """Did the server actually take the card we sent?
@@ -387,8 +392,17 @@ class LiveBelotBot:
         this is a redundancy against dropped messages, not the only path."""
         self.sync_engine.apply_combination(seat, value)
 
-    async def _select_and_execute_action(self, my_pos: int):
+    async def _select_and_execute_action(self, my_pos: int, turn_id: str):
         env = self.sync_engine.env
+
+        # One decision per turn. A re-dispatch replays from the SAME pre-turn
+        # hidden state (so the LSTM advances once per game decision, as in
+        # train.py collect_rollout) and blocks every action already refused.
+        if self._turn_decision is not None and self._turn_decision[0] == turn_id:
+            _, hidden_before, refused = self._turn_decision
+        else:
+            hidden_before, refused = self.hidden_state, set()
+            self._turn_decision = (turn_id, hidden_before, refused)
 
         local_obs, global_obs, legal_mask = build_observation(
             env,
@@ -397,6 +411,18 @@ class LiveBelotBot:
         )
 
         if not legal_mask.any():
+            print(f"[Bot][WARN] empty legal mask on our turn ({turn_id}); "
+                  f"nothing dispatched -- the turn will time out unless a "
+                  f"newer frame arrives")
+            self.last_action_turn_id = None      # allow an immediate retry
+            return
+
+        legal_mask = legal_mask.copy()
+        for a in refused:
+            legal_mask[a] = 0
+        if not legal_mask.any():
+            print("[Bot][WARN] every legal action has already been refused "
+                  "this turn; giving up rather than looping")
             return
 
         local_t = torch.from_numpy(local_obs).unsqueeze(0).to(self.device)
@@ -404,10 +430,14 @@ class LiveBelotBot:
         mask_t = torch.from_numpy(legal_mask).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            dist, _, self.hidden_state = self.model(
-                local_t, glob_t, self.hidden_state, mask_t, is_sequence=False
+            dist, _, new_hidden = self.model(
+                local_t, glob_t, hidden_before, mask_t, is_sequence=False
             )
             action = int(torch.argmax(dist.probs, dim=-1).item())
+
+        # Derived from hidden_before, never chained off a previous retry.
+        self.hidden_state = new_hidden
+        refused.add(action)
 
         await self._dispatch_action(action, env)
 
@@ -432,7 +462,28 @@ class LiveBelotBot:
                     print(f"{self._tag()}[Bot Action] -> ACCEPT FACE-UP (Suit: {colyseus_suit})")
                     await self.client.bid_trump(colyseus_suit)
             elif 34 <= action <= 37:
-                colyseus_suit = (action - 34) + 1
+                suit = action - 34
+                if env.face_up_suit is None:
+                    # env.get_legal_actions() compares `suit != face_up_suit`;
+                    # with None that is True for ALL FOUR suits, so the mask
+                    # can offer the flipped suit -- an illegal round-2 bid.
+                    # The server refuses it, the turn times out, and the
+                    # platform bot takes the seat (PLATFORM_NOTES §5.1, §12).
+                    if env.get_legal_actions()[32]:
+                        print("[Bot][CRITICAL] face_up_suit unknown in round 2; "
+                              "the suit mask is unreliable -- passing instead")
+                        await self.client.pass_turn()
+                        return
+                    print("[Bot][CRITICAL] face_up_suit unknown and passing is "
+                          f"illegal (we are the dealer); bidding suit {suit} "
+                          "blind -- this may be refused")
+                elif suit == env.face_up_suit:
+                    print(f"[Bot][CRITICAL] refusing to bid the face-up suit "
+                          f"{suit} in round 2 (illegal); passing instead")
+                    if env.get_legal_actions()[32]:
+                        await self.client.pass_turn()
+                        return
+                colyseus_suit = suit + 1
                 print(f"{self._tag()}[Bot Action] -> CHOOSE SUIT ({colyseus_suit})")
                 await self.client.bid_trump(colyseus_suit)
 

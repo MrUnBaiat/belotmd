@@ -1,5 +1,5 @@
 """
-inspect_frames.py — offline forensics on a recorded frames.jsonl.
+frame_inspector.py — offline forensics on a recorded frames.jsonl.
 
 Pure payload analysis: does NOT import belot_sync/env/torch, so it runs
 anywhere and can never be confused by a synchronizer bug. Answers the

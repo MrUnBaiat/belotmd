@@ -4,38 +4,64 @@ import WebSocket, { WebSocketServer } from 'ws';
 const BRIDGE_PORT = 8765;
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-let activeRoom = null;
-let pingInterval = null;
-
+// AUDIT: `activeRoom` / `pingInterval` were MODULE globals, so (a) a second
+// Python client silently hijacked the first one's room and (b) neither was
+// cleared on leave, so post-leave SENDs vanished into a dead room object.
 const wss = new WebSocketServer({ port: BRIDGE_PORT });
 console.log(`[Bridge] Daemon listening on ws://127.0.0.1:${BRIDGE_PORT}`);
 
 wss.on('connection', (pySocket) => {
     console.log("[Bridge] Python Agent connected.");
 
+    const session = { room: null, ping: null, closed: false };
+
+    // AUDIT: every send was unguarded. onStateChange/onMessage/onError fire
+    // from Colyseus internals, so a throw became an unhandled rejection while
+    // the room stayed joined.
+    const say = (obj) => {
+        if (session.closed || pySocket.readyState !== WebSocket.OPEN) return;
+        try { pySocket.send(JSON.stringify(obj)); }
+        catch (err) { console.error("[Bridge] send failed:", err.message); }
+    };
+
+    const dropRoom = () => {
+        if (session.ping) { clearInterval(session.ping); session.ping = null; }
+        if (session.room) { try { session.room.leave(); } catch (_) {} session.room = null; }
+    };
+
     pySocket.on('message', async (rawMsg) => {
         try {
             const cmd = JSON.parse(rawMsg);
             if (cmd.action === "CONNECT") {
-                await connectToGame(cmd.cookies, pySocket);
-            } else if (cmd.action === "SEND" && activeRoom) {
-                activeRoom.send(cmd.type, cmd.payload);
-            } else if (cmd.action === "LEAVE" && activeRoom) {
-                activeRoom.leave();
+                // AUDIT: a second CONNECT leaked the previous ping timer.
+                if (session.room || session.ping) {
+                    console.warn("[Bridge] CONNECT while a session is open — tearing the old one down first.");
+                    dropRoom();
+                }
+                await connectToGame(cmd.cookies, say, session);
+            } else if (cmd.action === "SEND") {
+                if (!session.room) { say({ event: "ERROR", message: "SEND with no active room" }); return; }
+                session.room.send(cmd.type, cmd.payload);
+            } else if (cmd.action === "LEAVE") {
+                dropRoom();
             }
         } catch (err) {
             console.error("[Bridge Error]:", err.message);
+            say({ event: "ERROR", message: err.message });
         }
     });
 
-    pySocket.on('close', () => {
-        console.log("[Bridge] Python Agent disconnected. Cleaning up room...");
-        if (activeRoom) activeRoom.leave();
-        if (pingInterval) clearInterval(pingInterval);
-    });
+    const cleanup = (why) => {
+        if (session.closed) return;
+        session.closed = true;
+        console.log(`[Bridge] Cleaning up session (${why}).`);
+        dropRoom();
+    };
+    pySocket.on('close', () => cleanup("python agent disconnected"));
+    pySocket.on('error', (e) => cleanup(`python socket error: ${e.message}`));
 });
 
-async function connectToGame(cookieString, pySocket) {
+async function connectToGame(cookieString, say, session) {
     const headers = {
         'Cookie': cookieString,
         'User-Agent': USER_AGENT,
@@ -92,32 +118,32 @@ async function connectToGame(cookieString, pySocket) {
 
         console.log(`[Bridge] Connecting Colyseus client to ${wsUrl}...`);
         const client = new Client(wsUrl);
-        activeRoom = await client.joinById(roomId, { token: playerToken, playerId: playerId });
+        const room = await client.joinById(roomId, { token: playerToken, playerId: playerId });
 
-        pingInterval = setInterval(() => {
+        // AUDIT: if Python vanished during the join handshake we would sit in
+        // the room forever with nobody listening.
+        if (session.closed) { try { room.leave(); } catch (_) {} return; }
+        session.room = room;
+
+        session.ping = setInterval(() => {
             fetch("https://belot.md/api/game.php?ping", { headers }).catch(() => {});
         }, 30_000);
 
-        activeRoom.onStateChange((state) => {
-            pySocket.send(JSON.stringify({ event: "STATE", data: state, myPlayerId: playerId }));
+        room.onStateChange((state) => say({ event: "STATE", data: state, myPlayerId: playerId }));
+        room.onMessage("*", (type, message) => say({ event: "MESSAGE", type, data: message }));
+        room.onError((code, message) => say({ event: "ERROR", code, message }));
+        room.onLeave((code) => {
+            say({ event: "LEAVE", code });
+            if (session.ping) { clearInterval(session.ping); session.ping = null; }
+            session.room = null;
         });
 
-        activeRoom.onMessage("*", (type, message) => {
-            pySocket.send(JSON.stringify({ event: "MESSAGE", type, data: message }));
-        });
-
-        activeRoom.onError((code, message) => {
-            pySocket.send(JSON.stringify({ event: "ERROR", code, message }));
-        });
-
-        activeRoom.onLeave((code) => {
-            pySocket.send(JSON.stringify({ event: "LEAVE", code }));
-            if (pingInterval) clearInterval(pingInterval);
-        });
-
-        pySocket.send(JSON.stringify({ event: "CONNECTED", roomId, playerId }));
+        say({ event: "CONNECTED", roomId, playerId });
 
     } catch (err) {
-        pySocket.send(JSON.stringify({ event: "ERROR", message: err.message }));
+        // AUDIT: on a partial failure the room may already be joined.
+        if (session.ping) { clearInterval(session.ping); session.ping = null; }
+        if (session.room) { try { session.room.leave(); } catch (_) {} session.room = null; }
+        say({ event: "ERROR", message: err.message });
     }
 }

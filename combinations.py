@@ -149,8 +149,15 @@ def declarable(value, ascii_to_id=None, include_win_all=False,
     for t, ch in parse_field(value):
         if t not in allowed:
             continue
-        if t == PATRU_CARTI and ascii_to_id is not None:
-            rank = four_rank(t, ch, ascii_to_id)
+        if t == PATRU_CARTI:
+            # FAIL CLOSED. Without the map (or with an unknown card char) the
+            # rank cannot be read, and the two effect-carrying ranks would
+            # slip through: four 7s cancels the deal, four 8s silences every
+            # combination except bella -- OURS INCLUDED. Withholding a
+            # 100/150/200-point declaration is a far cheaper mistake.
+            rank = four_rank(t, ch, ascii_to_id) if ascii_to_id is not None else None
+            if rank is None:
+                continue
             if rank == RANK_SEVEN and not include_four_sevens:
                 continue
             if rank == RANK_EIGHT and not include_four_eights:
