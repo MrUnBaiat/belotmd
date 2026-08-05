@@ -232,7 +232,11 @@ class Auditor:
             obs, gobs, mask = build_observation(env, me, sync.match_scores)
             if np.isnan(obs).any() or np.isnan(gobs).any():
                 self._emit("VIOLATION", "NaN in observation")
-            if not mask.any():
+            if not mask.any() and env.hands[me]:
+                # An empty mask with an EMPTY hand is legitimate: the server
+                # reports phase 10 with activePlayer set for one more frame
+                # after the last card of the last trick. Flagging it was
+                # noise that masked real signal (PLATFORM_NOTES §14.7).
                 self._emit("VIOLATION", "empty legal mask on our turn")
 
             bel = obs[BELIEF_SLICE].reshape(3, 32)
@@ -594,53 +598,8 @@ class Auditor:
                          f"offers declined so far")
             self._emit("PROBE", note)
 
-    def note_special(self, msg_type, data):
-        """Hand-altering server events. None of them need special handling in
-        the sync layer -- what matters is that the hand ends or is cancelled
-        cleanly -- but they change what the following frames MEAN, so they are
-        recorded and correlated with the phase path the hand actually took."""
-        who = data.get("who") if isinstance(data, dict) else None
-        effect = {
-            "LESS_THAN_14":  "deal CANCELLED, scoreboard unchanged",
-            "FOUR_OF_SEVEN": "deal CANCELLED (four 7s), scoreboard unchanged",
-            "FOUR_OF_EIGHT": "combinations DISABLED except bella; hand continues",
-            "WIN_ALL_HANDS": "fast-forward: claimant takes every remaining "
-                             "trick, points DO score",
-            "SURRENDER_BT":  "fast-forward: claimant concedes and takes a "
-                             "bolt, points DO score",
-            "BIZON":         "forced trump; bidding and the swap window are "
-                             "skipped",
-        }.get(msg_type, "unknown effect")
-        self._pending_special = (msg_type, who)
-        self._emit("INFO", f"{msg_type} by seat {who} -- {effect}")
 
-    def note_combination(self, seat, value, source):
-        """Record a declaration and check the wire syntax of the non-card
-        claim types, whose trailing char is believed to be a filler 'a'."""
-        for type_id, ch in combo.parse_field(value or ""):
-            if type_id in combo.CLAIM_COMBOS:
-                key = (type_id, ch)
-                if key in self._claim_syntax:
-                    continue
-                self._claim_syntax.add(key)
-                name = combo.TYPE_NAMES.get(type_id, str(type_id))
-                verdict = ("filler 'a' as expected"
-                           if ch == combo.CLAIM_FILLER else
-                           f"trailing char is '{ch}', NOT 'a' -- our outgoing "
-                           f"token {combo.claim_token(type_id)} may be wrong")
-                self._emit("PROBE",
-                           f"claim declaration {type_id}{ch} ({name}) via "
-                           f"{source}, seat {seat}: {verdict}")
 
-    def _probe_combo_flow(self, raw_state):
-        for i, p in enumerate(raw_state.get("players", [])):
-            v = p.get("combinationsCanShow") or ""
-            if v and (i, v) not in self._combo_flagged:
-                self._combo_flagged.add((i, v))
-                self._emit("PROBE",
-                           f"combinationsCanShow='{v}' for seat {i} — sniff "
-                           f"the message the human client sends here; the bot "
-                           f"has no combo action and may need an auto-reply.")
 
 
 # ----------------------------------------------------------------------
