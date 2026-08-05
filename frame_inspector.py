@@ -1,13 +1,32 @@
 """
 frame_inspector.py — offline forensics on a recorded frames.jsonl.
 
-Pure payload analysis: does NOT import belot_sync/env/torch, so it runs
-anywhere and can never be confused by a synchronizer bug. Answers the
-questions the live session raised.
+Pure payload analysis: does NOT import belot_sync / env / torch, so it runs
+anywhere and can never be confused by a synchronizer bug. That independence is
+the whole point — it is the second opinion.
 
-Usage:
-    python inspect_frames.py                 # defaults to frames.jsonl
-    python inspect_frames.py frames.jsonl
+    python frame_inspector.py                 # defaults to frames.jsonl
+    python frame_inspector.py frames.jsonl
+    python frame_inspector.py frames.jsonl -q # findings only
+
+Exit code is 1 if any FINDING was raised, so it can gate a run.
+
+Changes from the previous version, every one driven by a real capture:
+
+  §1   reconciles each hand's scoreTable delta against roundTotals.b, and
+       knows the THIRD BOLT COSTS 10 POINTS. This is the check that catches
+       the "deltas (-7,13) vs b(3,13)" class of error; the old version could
+       not see it because it only listed the BT cells.
+  §2b  the seven-swap probe now requires swapSeven >= 0 or phase >= 8. The old
+       one fired on every deal (topCard stays stale until phase 5) and in a
+       capture that contained a REAL swap it was buried among 8 false hits.
+  §3   adds card conservation — the same card appearing twice in one deal.
+  §5   no longer claims "the model has no combo action"; it does, and it
+       withholds some offers deliberately.
+  §6   inventories phases against a KNOWN set and shouts about anything else.
+       An unknown phase is how the SURRENDER_BT path (10 -> 12 -> 13) hid.
+  NEW  session splitting: FrameRecorder appends, so one file can hold several
+       matches and diffing across the seam produces nonsense.
 """
 import json
 import sys
@@ -17,6 +36,19 @@ CHARS = ("yzabcdef" "ABghijkl" "CDmnopqr" "EFstuvwx")
 CARD_ID = {c: i for i, c in enumerate(CHARS)}
 SUITS = ["diamonds", "hearts", "clubs", "spades"]
 RANKS = ["7", "8", "9", "10", "J", "Q", "K", "A"]
+
+KNOWN_PHASES = {
+    0: "LOBBY", 1: "ABORT", 2: "CUT_DECK", 5: "DEAL_5", 6: "TRUMP_CHOOSE_1",
+    7: "TRUMP_CHOOSE_2", 8: "SWAP_WINDOW", 9: "DEAL_3", 10: "PLAYING",
+    11: "TRICK_RESOLVE", 12: "CLAIM_RESOLVE", 13: "HAND_END", 14: "MATCH_END",
+}
+END_PHASES = (12, 13, 14)
+FINDINGS = []
+
+
+def finding(section, msg):
+    FINDINGS.append((section, msg))
+    print(f"  *** FINDING [{section}] {msg}")
 
 
 def name(ch):
@@ -47,240 +79,380 @@ def jparse(v, default):
     return v if v is not None else default
 
 
+def bolt_marker(cell):
+    """'BT-3' / 'bt_3' / 'BT3' -> 3.  Anything else -> None."""
+    if not isinstance(cell, str):
+        return None
+    s = cell.strip().upper().replace("_", "-")
+    if not s.startswith("BT"):
+        return None
+    digits = "".join(c for c in s if c.isdigit())
+    return int(digits) if digits else 0
+
+
 def h(title):
     print("\n" + "=" * 72)
     print(title)
     print("=" * 72)
 
 
-def main(path="frames.jsonl"):
-    recs = load(path)
-    if not recs:
-        print(f"No frames in {path}")
-        return
-    print(f"Loaded {len(recs)} frames from {path}")
+def split_sessions(recs):
+    """FrameRecorder opens frames.jsonl in APPEND mode, so one file can hold
+    several matches. Split on gameStartTime, a long time gap, or a scoreTable
+    that shrinks."""
+    sessions, cur = [], []
+    prev_gst = prev_t = prev_rows = None
+    for r in recs:
+        st = r.get("state", {})
+        gst, t = st.get("gameStartTime"), r.get("t")
+        rows = len(jparse(st.get("scoreTable", "[]"), []) or [])
+        boundary = (
+            (prev_gst is not None and gst is not None and gst != prev_gst)
+            or (prev_t is not None and t is not None and t - prev_t > 600)
+            or (prev_rows is not None and rows < prev_rows)
+        )
+        if boundary and cur:
+            sessions.append(cur)
+            cur = []
+        cur.append(r)
+        if gst is not None:
+            prev_gst = gst
+        prev_t, prev_rows = t, rows
+    if cur:
+        sessions.append(cur)
+    return sessions
 
-    # ---------------- 1. THE CRASH: non-numeric scoreTable ---------------
-    h("1. scoreTable cells  (source of the live TypeError)")
-    seen, anomalies = OrderedDict(), []
+
+# ---------------------------------------------------------------- sections
+def sec_scoring(recs, base):
+    h("1. scoreTable — cell types, bolts, and delta vs roundTotals.b")
+    seen, unknown = OrderedDict(), []
     for i, r in enumerate(recs):
         raw = r["state"].get("scoreTable")
-        if raw is None:
+        if raw in (None, ""):
             continue
-        seen.setdefault(json.dumps(raw), i)
-        tbl = jparse(raw, [])
-        for ri, row in enumerate(tbl if isinstance(tbl, list) else []):
-            for ci, cell in enumerate(row if isinstance(row, list) else []):
-                if isinstance(cell, bool) or not isinstance(cell, (int, float)):
-                    anomalies.append((i, ri, ci, cell, raw))
-    print(f"distinct scoreTable values: {len(seen)}")
-    for v, first in list(seen.items())[-4:]:
-        print(f"  first@f{first}: {v}")
-    bolts = [(i, ri, ci, c) for i, ri, ci, c, _ in anomalies
-             if isinstance(c, str) and c.upper().startswith("BT")]
-    other = [a for a in anomalies if a not in
-             [(i, ri, ci, c, r) for i, ri, ci, c, r in anomalies
-              if isinstance(c, str) and c.upper().startswith("BT")]]
-    if bolts:
-        rows = sorted({(ri, ci, c) for _, ri, ci, c in bolts})
-        print(f"\n  BT markers (DECODED: team bolted, gained 0 that round, "
-              f"N = bolt number; cumulative carries forward):")
-        for ri, ci, c in rows:
-            print(f"    row {ri} col {ci} = {c!r}")
-        print("  -> handled by belot_sync._bolt_marker (naive int() gives -1!)")
-    if other:
-        print(f"\n  *** {len(other)} UNRECOGNISED non-numeric cell(s) — new format:")
-        for i, ri, ci, cell, raw in other[:5]:
-            st = recs[i]["state"]
-            print(f"    f{i} row{ri} col{ci} = {cell!r}  table={raw}")
-            print(f"        phase={st.get('currentPhase')} round={st.get('round')} "
-                  f"roundTotals={st.get('roundTotals')}")
-    if not anomalies:
-        print("  all cells numeric in this recording")
+        # key on the canonical form, but KEEP the raw value: `raw` is already a
+        # JSON string, so json.dumps(raw) double-encodes it and jparse then
+        # hands back a str instead of the table.
+        seen.setdefault(json.dumps(raw), raw)
+        for row in jparse(raw, []) or []:
+            for cell in row if isinstance(row, list) else []:
+                if isinstance(cell, (int, float)) and not isinstance(cell, bool):
+                    continue
+                if bolt_marker(cell) is None and cell not in ("", None):
+                    unknown.append((base + i, cell))
+    print(f"  distinct scoreTable values: {len(seen)}")
+    if seen:
+        print(f"  final: {list(seen.values())[-1]}")
+    if unknown:
+        finding("1", f"{len(unknown)} non-numeric cell(s) that are NOT bolt "
+                     f"markers -- new format: {unknown[:3]}")
 
-    # ---------------- 2. stale trump / declarer during bidding -----------
+    table = jparse(list(seen.values())[-1], []) if seen else []
+    if not isinstance(table, list) or not table:
+        print("  (no table to reconcile)")
+        return
+
+    bs, prev_key = [], None
+    for r in recs:
+        raw = r["state"].get("roundTotals")
+        if raw in (None, ""):
+            continue
+        key = json.dumps(raw)
+        if key == prev_key:
+            continue
+        prev_key = key
+        rt = jparse(raw, [])
+        if isinstance(rt, list) and len(rt) == 2:
+            bs.append((rt[0].get("b"), rt[1].get("b")))
+
+    print(f"\n  {'hand':>4}  {'row':<22} {'cumulative':>14} {'delta':>12} "
+          f"{'roundTotals.b':>16}")
+    scores, bolts, bad = [0, 0], [0, 0], 0
+    for i, row in enumerate(table):
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        prev = list(scores)
+        for t in (0, 1):
+            n = bolt_marker(row[t])
+            if n is not None:
+                bolts[t] = n % 3
+                if n and n % 3 == 0:
+                    # Confirmed live: the third bolt costs 10 and the penalty
+                    # is invisible because the cell is the string 'BT-3'.
+                    scores[t] -= 10
+            else:
+                try:
+                    scores[t] = int(row[t])
+                except (TypeError, ValueError):
+                    pass
+        delta = (scores[0] - prev[0], scores[1] - prev[1])
+        b = bs[i] if i < len(bs) else (None, None)
+        flag = ""
+        for t in (0, 1):
+            if isinstance(b[t], (int, float)) and b[t] != delta[t]:
+                flag, bad = "  <-- MISMATCH", bad + 1
+        print(f"  {i+1:>4}  {str(row):<22} {str(scores):>14} {str(delta):>12} "
+              f"{str(b):>16}{flag}")
+    if bad:
+        finding("1", f"{bad} hand(s) where the scoreTable delta disagrees with "
+                     f"roundTotals.b -- the scoring model is wrong somewhere")
+    else:
+        print(f"\n  all {len(table)} hand(s) reconcile "
+              f"(including the -10 third-bolt penalty)")
+    print(f"  final cumulative {scores}, bolt counters {bolts}")
+
+
+def sec_stale(recs, base):
     h("2. trump / declarer staleness through the deal and bidding")
     stale = fresh = 0
+    first = []
     for i, r in enumerate(recs):
         st = r["state"]
-        ph = st.get("currentPhase")
-        if ph not in (2, 3, 4, 5, 6, 7):
+        if st.get("currentPhase") not in (2, 3, 4, 5, 6, 7):
             continue
         t, d = st.get("trump", -1), st.get("declarer", -1)
         if (isinstance(t, int) and 1 <= t <= 4) or (isinstance(d, int) and d >= 0):
             stale += 1
-            if stale <= 3:
-                print(f"  f{i:>4} phase {ph}: trump={t} declarer={d} "
-                      f"(training guarantees BOTH unset while bidding)")
+            if len(first) < 2:
+                first.append(f"f{base+i} phase {st.get('currentPhase')}: "
+                             f"trump={t} declarer={d}")
         else:
             fresh += 1
+    for s in first:
+        print(f"  {s}")
     print(f"  {stale} deal/bidding frames carry a trump or declarer, "
           f"{fresh} do not")
     if stale:
-        print("  -> CONFIRMED stale. belot_sync suppresses both until phase 8+,\n"
-              "     otherwise obs features 3 and 4 are wrong for every bid.")
+        print("  -> stale as documented; both must stay suppressed until "
+              "phase 8+, or obs features 3 and 4 are wrong for every bid.")
 
-    # ---------------- 2b. topCard rewritten by a swap --------------------
-    h("2b. topCard rewrite (seven-swap bookkeeping)")
-    prev_top, prev_round, hits = None, None, 0
+
+def sec_swap(recs, base):
+    h("2b. seven-swap (topCard rewrite) -- gated, not every deal")
+    prev_top, hits, deals = None, 0, 0
     for i, r in enumerate(recs):
         st = r["state"]
-        top, rnd = st.get("topCard", ""), st.get("round")
-        if rnd == prev_round and top and prev_top and top != prev_top:
-            sw = st.get("swapSeven", -1)
-            hits += 1
-            print(f"  f{i:>4} round {rnd}: topCard '{prev_top}' -> '{top}' "
-                  f"with swapSeven={sw} (phase {st.get('currentPhase')})")
+        top, ph = st.get("topCard", ""), st.get("currentPhase", -1)
+        sw = st.get("swapSeven", -1)
+        if top and prev_top and top != prev_top:
+            if (isinstance(sw, int) and sw >= 0) or ph in (8, 9):
+                hits += 1
+                print(f"  f{base+i} phase {ph}: topCard '{prev_top}' "
+                      f"({name(prev_top)}) -> '{top}' ({name(top)}) "
+                      f"swapSeven={sw}   <-- REAL swap")
+            else:
+                deals += 1
         if top:
             prev_top = top
-        prev_round = rnd
-    if not hits:
-        print("  no mid-hand rewrite in this recording")
-    else:
-        print("  -> the flipped card is replaced by the 7 the declarer got;\n"
-              "     belot_sync freezes the pre-swap value.")
+    print(f"  {hits} genuine rewrite(s); {deals} ordinary deal flips ignored")
+    print("  (topCard does NOT clear at phase 2, so it changes on every deal "
+          "at phase 5.")
+    print("   Only swapSeven >= 0, or a change inside the swap window "
+          "(phase 8/9), is a swap.)")
+    if hits:
+        print("  -> the flip is replaced by the 7 the declarer received; the "
+              "PRE-swap value must stay frozen as face_up_card.")
 
-    # ---------------- 2c. swapSeven semantics ----------------------------
     h("2c. swapSeven field")
-    vals = Counter()
-    for r in recs:
-        v = r["state"].get("swapSeven", -1)
-        vals[v] += 1
+    vals = Counter(r["state"].get("swapSeven", -1) for r in recs)
     print(f"  observed values: {dict(vals)}")
     bad = [v for v in vals if not isinstance(v, int) or v < -1 or v > 3]
     if bad:
-        print(f"  *** values outside seat range: {bad} -- NOT a seat index!")
+        finding("2c", f"values outside seat range: {bad} -- not a seat index")
     else:
-        print("  all values are -1 or a valid seat index (0-3), "
-              "consistent with 'seat that swapped'")
+        print("  all -1 or a valid seat index (0-3)")
 
-    h("3. lastCards vs table cards  (seat-indexing holds?)")
-    # The server wipes the table in the same frame it publishes lastCards, so
-    # compare against the LAST SEEN table rather than the current one.
+
+def sec_tricks(recs, base):
+    h("3. lastCards vs the table -- seat indexing and card conservation")
     ok = bad = 0
-    table = {}
-    prev_lc = None
-    for r in recs:
+    table, prev_lc, graveyard, dupes = {}, None, [], []
+    for i, r in enumerate(recs):
         st = r["state"]
-        for i, p in enumerate(st.get("players", [])):
+        if st.get("currentPhase") in (2, 5):
+            graveyard = []
+        for s, p in enumerate(st.get("players", [])):
             ch = p.get("cardPlayed")
             if ch and ch in CARD_ID:
-                table[i] = ch
+                table[s] = ch
         lc = st.get("lastCards") or ""
         lc = "".join(lc) if isinstance(lc, list) else lc
         if len(lc) == 4 and lc != prev_lc:
             prev_lc = lc
             if len(table) == 4 and set(table.values()) == set(lc):
-                by_seat = "".join(table[s2] for s2 in sorted(table))
+                by_seat = "".join(table[s] for s in sorted(table))
                 if by_seat == lc:
                     ok += 1
                 else:
                     bad += 1
-                    print(f"  MISMATCH: lastCards={lc} seat-order={by_seat}")
+                    finding("3", f"f{base+i} lastCards={lc} but seat-order="
+                                 f"{by_seat} -- NOT seat-indexed")
+            for c in lc:
+                if c in graveyard:
+                    dupes.append((base + i, c))
+                graveyard.append(c)
             table = {}
-    print(f"  conclusive samples: {ok} consistent, {bad} mismatched")
+    print(f"  conclusive trick samples: {ok} consistent, {bad} mismatched")
     if ok and not bad:
         print("  -> SEAT-INDEXED confirmed.")
-    elif not ok:
-        print("  -> inconclusive here; the live auditor validates every trick.")
+    if dupes:
+        finding("3", f"{len(dupes)} card(s) appeared twice inside one deal, "
+                     f"e.g. {dupes[:3]} -- a trick was double-counted")
+    else:
+        print("  no card appeared twice within a deal")
 
-    # ---------------- 4. points vs roundTotals (combo leakage) -----------
-    h("4. per-player points vs roundTotals.p  (are combos folded in?)")
-    prev_rt, last_pts = None, None
+
+def sec_points(recs, base):
+    h("4. roundTotals.p -- do trick points still total 162?")
+    prev, shown = None, 0
     for i, r in enumerate(recs):
-        st = r["state"]
-        rt_raw = st.get("roundTotals")
-        pls = st.get("players", [])
-        if st.get("currentPhase") == 10 and len(pls) == 4:
-            last_pts = [int(p.get("points", 0) or 0) for p in pls]
-        if rt_raw is None:
+        raw = r["state"].get("roundTotals")
+        if raw in (None, ""):
             continue
-        key = json.dumps(rt_raw)
-        if prev_rt is not None and key != prev_rt and last_pts:
-            rt = jparse(rt_raw, [])
-            if isinstance(rt, list) and len(rt) == 2:
-                t0, t1 = last_pts[0] + last_pts[2], last_pts[1] + last_pts[3]
-                p0, p1 = rt[0].get("p", 0), rt[1].get("p", 0)
-                c0, c1 = rt[0].get("c", 0), rt[1].get("c", 0)
-                # The invariant that settles it: trick points always total
-                # 162 (incl. the 10-point pasledu); combos live in `c`.
-                v = ("162 OK -> tricks+pasledu, combos excluded "
-                     "(training-compatible)" if p0 + p1 == 162 else
-                     f"*** p0+p1={p0 + p1} != 162 -- semantics changed!")
-                lag = (p0 - t0) + (p1 - t1)
-                print(f"  f{i:>4} p({p0},{p1}) c({c0},{c1}) "
-                      f"b({rt[0].get('b')},{rt[1].get('b')}) -> {v}")
-                if lag:
-                    print(f"        (tracked ({t0},{t1}) trails by {lag}: "
-                          f"final trick + pasledu land after the last "
-                          f"PLAYING frame — expected)")
-        prev_rt = key
+        key = json.dumps(raw)
+        if key == prev:
+            continue
+        prev = key
+        rt = jparse(raw, [])
+        if not (isinstance(rt, list) and len(rt) == 2):
+            continue
+        p0, p1 = rt[0].get("p", 0), rt[1].get("p", 0)
+        c0, c1 = rt[0].get("c", 0), rt[1].get("c", 0)
+        shown += 1
+        if p0 + p1 != 162:
+            finding("4", f"f{base+i} p({p0},{p1}) sums to {p0+p1}, not 162 -- "
+                         f"the points semantics changed")
+        else:
+            print(f"  f{base+i:>4} p({p0},{p1}) c({c0},{c1}) -> 162 OK "
+                  f"(tricks+pasledu; combos live in c)")
+    if not shown:
+        print("  (no roundTotals in this session)")
 
-    # ---------------- 4b. cancelled hands (LESS_THAN_14) -----------------
+
+def sec_cancelled(recs, base):
     h("4b. cancelled hands (LESS_THAN_14 voids the deal)")
     prev_rows, dup = None, 0
     for i, r in enumerate(recs):
-        st = r["state"]
-        tbl = jparse(st.get("scoreTable", "[]"), [])
+        tbl = jparse(r["state"].get("scoreTable", "[]"), [])
         if not isinstance(tbl, list) or not tbl:
             continue
         n = len(tbl)
-        if prev_rows is not None and n == prev_rows + 1 and n >= 2:
-            a, b = tbl[-2], tbl[-1]
-            if isinstance(a, list) and isinstance(b, list) and a == b:
-                dup += 1
-                print(f"  f{i:>4} round {st.get('round')}: duplicate row {b} "
-                      f"-> hand voided, match score unchanged")
+        if (prev_rows is not None and n == prev_rows + 1 and n >= 2
+                and tbl[-2] == tbl[-1]):
+            dup += 1
+            print(f"  f{base+i} round {r['state'].get('round')}: duplicate row "
+                  f"{tbl[-1]} -> hand voided, match score unchanged")
         prev_rows = n
     if dup:
-        print(f"\n  {dup} cancelled hand(s). The server appends a duplicate")
-        print("  cumulative row and leaves roundTotals on the PREVIOUS hand,")
-        print("  so a b() comparison there is meaningless. belot_sync forces a")
-        print("  reset on the 10 -> 1 abort even if `round` is reused.")
+        print(f"  {dup} cancelled hand(s). roundTotals stays on the PREVIOUS "
+              f"hand, so a b() comparison there is meaningless. A reset must "
+              f"be forced on the 10 -> 1/2 abort even if `round` is reused.")
     else:
         print("  none in this recording")
 
-    # ---------------- 5. combinations -------------------------------------
-    h("5. combination fields  (does the bot ever need to respond?)")
-    mine = Counter(); theirs = Counter()
+
+def sec_combos(recs, base):
+    h("5. combinations offered to us vs declared")
     my_pid = recs[0].get("pid")
+    mine, theirs, ours_declared = Counter(), Counter(), Counter()
     for r in recs:
         for p in r["state"].get("players", []):
+            is_me = str(p.get("id")) == str(my_pid)
             v = p.get("combinationsCanShow") or ""
-            if not v:
-                continue
-            (mine if str(p.get("id")) == str(my_pid) else theirs)[v] += 1
-    print(f"  our seat  ({my_pid}): {dict(mine) or 'never'}")
-    print(f"  opponents          : {dict(theirs) or 'never'}")
-    if mine:
-        print("  *** We were offered a declaration. The model has no combo "
-              "action, so we forfeit those points; sniff the browser's "
-              "WebSocket for the message type if you want them.")
-    else:
-        print("  We were never offered one in this recording -> no stall risk "
-              "observed; opponents' declarations only affect their score.")
+            if v:
+                (mine if is_me else theirs)[v] += 1
+            d = p.get("combinations") or ""
+            if d and is_me:
+                ours_declared[d] += 1
+    print(f"  our seat ({my_pid}) was OFFERED : {dict(mine) or 'never'}")
+    print(f"  our seat DECLARED              : {dict(ours_declared) or 'never'}")
+    print(f"  opponents were offered         : {dict(theirs) or 'never'}")
+    claims = sorted({k.split('|')[-1] for k in mine if k[:1] in "6789"})
+    if claims:
+        print(f"  claim-type offers: {claims} "
+              f"(6=LESS_THAN_14 7=BELOT 8=WIN_ALL 9=SURRENDER_BT)")
+        print("  these are withheld by policy -- declining is intentional, "
+              "not a stall.")
+    never = sorted(set(mine) - set(ours_declared))
+    if never:
+        print(f"  offered but never declared: {never}")
+        print("  check AUTO_DECLARE switches (four 7s/8s, WIN_ALL, "
+              "SURRENDER_BT are deliberately withheld).")
 
-    # ---------------- 6. lifecycle / frame health -------------------------
-    h("6. phase transitions & frame health")
-    trans, prev = Counter(), None
-    swaps = 0
+
+def sec_lifecycle(recs, base):
+    h("6. phase inventory, transitions and session boundaries")
+    trans, prev, phases = Counter(), None, Counter()
     for r in recs:
-        st = r["state"]
-        ph = st.get("currentPhase")
+        ph = r["state"].get("currentPhase")
+        phases[ph] += 1
         if prev is not None and ph != prev:
             trans[(prev, ph)] += 1
         prev = ph
-        if (st.get("swapSeven", -1) or -1) >= 0:
-            swaps += 1
+    for ph, n in sorted(phases.items(), key=lambda kv: (kv[0] is None, kv[0])):
+        known = ph in KNOWN_PHASES
+        print(f"  phase {str(ph):>3} {KNOWN_PHASES.get(ph, 'UNKNOWN'):<14} x{n}"
+              f"{'' if known else '   <-- UNKNOWN'}")
+        if not known:
+            finding("6", f"phase {ph} is not in the known set -- every "
+                         f"phase-gated branch needs reviewing for it")
+    print()
     for (a, b), n in sorted(trans.items()):
-        print(f"  {a:>3} -> {b:<3}  x{n}")
-    print(f"  swapSeven active in {swaps} frame(s)")
-    if any(a >= 10 and b >= 10 for (a, b) in trans if a != b):
-        print("  note: play-phase-to-play-phase transitions present")
-    if not any(b in (6, 7) for (_, b) in trans):
-        print("  *** no transition INTO bidding was ever observed -> the "
-              "hand-reset latch (_pending_reset) is doing real work here.")
+        note = ""
+        if a == 5 and b == 9:
+            note = "   (BIZON: bidding skipped entirely)"
+        elif b == 12:
+            note = "   (claim resolution -- must count as an END phase)"
+        elif a == 14:
+            note = "   (match over -> lobby: a 4005 here is a reshuffle, "
+            note += "not a mid-match violation)"
+        print(f"  {a:>3} -> {b:<3} x{n}{note}")
+
+
+def run(recs, base, quiet):
+    sec_scoring(recs, base)
+    if not quiet:
+        sec_stale(recs, base)
+    sec_swap(recs, base)
+    sec_tricks(recs, base)
+    sec_points(recs, base)
+    sec_cancelled(recs, base)
+    sec_combos(recs, base)
+    sec_lifecycle(recs, base)
+
+
+def main(path="frames.jsonl", quiet=False):
+    recs = load(path)
+    if not recs:
+        print(f"No frames in {path}")
+        return 0
+    print(f"Loaded {len(recs)} frames from {path}")
+    sessions = split_sessions(recs)
+    if len(sessions) > 1:
+        print(f"Detected {len(sessions)} sessions in this file (the recorder "
+              f"appends). Analysing each independently -- diffing across the "
+              f"seam would produce nonsense.")
+    off = 0
+    for n, s in enumerate(sessions, 1):
+        if len(sessions) > 1:
+            print("\n" + "#" * 72)
+            print(f"# SESSION {n}/{len(sessions)}  ({len(s)} frames, "
+                  f"f{off}..f{off + len(s) - 1})")
+            print("#" * 72)
+        run(s, off, quiet)
+        off += len(s)
+
+    h("SUMMARY")
+    if FINDINGS:
+        print(f"  {len(FINDINGS)} finding(s):")
+        for sec, msg in FINDINGS:
+            print(f"    [{sec}] {msg}")
+        return 1
+    print("  no mismatches detected in this recording")
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "frames.jsonl")
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    sys.exit(main(args[0] if args else "frames.jsonl", "-q" in sys.argv))
