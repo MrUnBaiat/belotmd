@@ -5,25 +5,50 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "belotmd"
 version = "1.0.0"
-description = "A bot that plays Belot against real players on belot.md"
+description = "An SDK for building bots that play Belot on belot.md"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
-keywords = ["belot", "belote", "card-game", "bot", "reinforcement-learning", "colyseus"]
-
-dependencies = [
-    "numpy>=1.24",
-    "websockets>=12.0",
+license = { file = "LICENSE" }
+authors = [{ name = "Cristian" }]
+keywords = [
+    "belot", "belote", "card-game", "bot", "sdk",
+    "colyseus", "websocket", "game-ai", "imperfect-information",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment :: Board Games",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+# numpy alone covers the rules and belief layers. Playing a live session also
+# needs websockets (and Node, for the bridge) — see the "live" extra.
+dependencies = ["numpy>=1.24"]
+
 [project.optional-dependencies]
-# The reference recurrent-MAPPO agent. Everything else — the bridge, the
-# synchronizer, the auditor, the random agent — runs without it.
-ppo = ["torch>=2.0"]
-dev = ["pytest>=7.0"]
+live = ["websockets>=12.0"]
+dev = ["websockets>=12.0", "pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/cristipojoga/belotmd"
+Documentation = "https://github.com/cristipojoga/belotmd/blob/main/docs/PLATFORM_NOTES.md"
+Issues = "https://github.com/cristipojoga/belotmd/issues"
 
 [project.scripts]
 belot-bot = "belotmd.cli:main"
+
+# Agents from other packages are discovered through this group:
+#
+#   [project.entry-points."belotmd.agents"]
+#   my-agent = "my_package.agent:build"
+#
+# `belot-bot --agent my-agent` then works with no change to this package.
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -6,22 +6,43 @@ import argparse
 import asyncio
 import sys
 
-from .agents import available, get_agent
+from .agents import available
 from .config import Config
 
 
+def _agent_kwarg(text):
+    """Parse a --agent-arg KEY=VALUE pair. Values stay strings; an agent that
+    wants a number can coerce it, and guessing types here would be worse."""
+    key, sep, value = text.partition("=")
+    if not sep or not key.strip():
+        raise argparse.ArgumentTypeError(
+            f"expected KEY=VALUE, got {text!r}"
+        )
+    return key.strip(), value
+
+
 def build_parser():
+    known = ", ".join(available()) or "(none installed)"
     p = argparse.ArgumentParser(
         prog="belot-bot",
         description="Play Belot on belot.md with a pluggable agent.",
-        epilog="Credentials come from BELOT_COOKIES (see .env.example). "
-               "Every flag below also has a BELOT_* environment variable.",
+        epilog=(
+            f"Installed agents: {known}. Agents from other packages are "
+            f"discovered through the 'belotmd.agents' entry-point group -- "
+            f"install the package and its name appears here. Credentials "
+            f"come from BELOT_COOKIES; see .env.example, which also documents "
+            f"the BELOT_* equivalent of every flag below."
+        ),
     )
-    p.add_argument("--agent", choices=available(), default=None,
-                   help="decision-maker to use (default: ppo, or $BELOT_AGENT)")
+    p.add_argument("--agent", default=None, metavar="NAME",
+                   help=f"decision-maker to use (default: random). "
+                        f"Currently installed: {known}")
     p.add_argument("--checkpoint", default=None, metavar="PATH",
-                   help="weights for a learned agent; searched in "
-                        "checkpoints/ when omitted")
+                   help="convenience alias for --agent-arg checkpoint=PATH")
+    p.add_argument("--agent-arg", action="append", default=[],
+                   type=_agent_kwarg, metavar="KEY=VALUE",
+                   help="pass an option through to the agent's factory; "
+                        "repeatable")
     p.add_argument("--frames", dest="frames_path", default=None, metavar="PATH",
                    help="where to record raw state frames (default frames.jsonl)")
 
@@ -32,7 +53,7 @@ def build_parser():
                        help="run without recording or auditing")
 
     p.add_argument("--list-agents", action="store_true",
-                   help="print the registered agents and exit")
+                   help="print the agents this environment can build, and exit")
     return p
 
 
@@ -40,22 +61,34 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
 
     if args.list_agents:
-        for name in available():
+        names = available()
+        if not names:
+            print("no agents installed", file=sys.stderr)
+            return 1
+        for name in names:
             print(name)
         return 0
 
+    agent_kwargs = dict(args.agent_arg)
+    if args.checkpoint is not None:
+        agent_kwargs["checkpoint"] = args.checkpoint
+
     cfg = Config.from_env(
         agent=args.agent,
-        checkpoint=args.checkpoint,
         frames_path=args.frames_path,
         audit=args.audit,
     )
     cfg.require_cookies()
 
-    # Imported here so `--list-agents` and `--help` work without websockets.
+    # Imported here so --help and --list-agents work without websockets.
     from .bot import LiveBelotBot
 
-    bot = LiveBelotBot(config=cfg)
+    try:
+        bot = LiveBelotBot(config=cfg, agent_kwargs=agent_kwargs)
+    except (ValueError, ImportError) as exc:
+        print(f"belot-bot: {exc}", file=sys.stderr)
+        return 2
+
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:

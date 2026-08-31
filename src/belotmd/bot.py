@@ -34,16 +34,20 @@ from .platform.sync import StateSynchronizer
 class LiveBelotBot:
     """Plays one belot.md session with the supplied agent."""
 
-    def __init__(self, config: Config = None, agent=None):
+    def __init__(self, config: Config = None, agent=None, agent_kwargs=None):
         self.config = config or Config.from_env()
         self.client = BelotClient(cookies=self.config.require_cookies())
         self.sync_engine = StateSynchronizer()
 
         # The decision-maker. Anything satisfying belotmd.agents.base.Agent
-        # works; nothing below this line knows which one it got.
-        self.agent = agent or get_agent(
-            self.config.agent, checkpoint=self.config.checkpoint or None
-        )
+        # works; nothing below this line knows which one it got. Pass one in
+        # directly, or name it in the config and let the registry build it.
+        if agent is None:
+            kwargs = dict(agent_kwargs or {})
+            if self.config.checkpoint and "checkpoint" not in kwargs:
+                kwargs["checkpoint"] = self.config.checkpoint
+            agent = get_agent(self.config.agent, **kwargs)
+        self.agent = agent
         print(f"[Bot] Agent: {getattr(self.agent, 'name', type(self.agent).__name__)}")
 
         # Turn debounce (replaces the old hard dedup, which deadlocked the
@@ -172,7 +176,7 @@ class LiveBelotBot:
                 return
             if self.last_action_turn_id == turn_id:
                 print(f"[Bot][WARN] State unchanged {redispatch_after}s after "
-                      f"dispatch — re-dispatching (possible server rejection): "
+                      f"dispatch -- re-dispatching (possible server rejection): "
                       f"{turn_id}")
             self.last_action_turn_id = turn_id
             self.last_dispatch_ts = now

@@ -76,7 +76,10 @@ class Config:
     auto_swap_seven: bool = True
 
     # --- agent ---
-    agent: str = "ppo"
+    # `random` is the only agent this package ships. Anything else comes from
+    # a separately installed package advertising a "belotmd.agents" entry
+    # point; name it here or with --agent.
+    agent: str = "random"
     checkpoint: str = ""
 
     # --- timing ---
@@ -100,7 +103,7 @@ class Config:
             declare_four_eights=_flag("BELOT_DECLARE_FOUR_EIGHTS", False),
             declare_win_all=_flag("BELOT_DECLARE_WIN_ALL", False),
             auto_swap_seven=_flag("BELOT_AUTO_SWAP_SEVEN", True),
-            agent=os.environ.get("BELOT_AGENT", "ppo"),
+            agent=os.environ.get("BELOT_AGENT", "random"),
             checkpoint=os.environ.get("BELOT_CHECKPOINT", ""),
         )
         for key, value in overrides.items():
