@@ -12,7 +12,7 @@ import numpy as np
 from belotmd.platform.sync import StateSynchronizer
 from belotmd.platform.protocol import ASCII_TO_ID
 from belotmd.audit import Auditor
-from belotmd.agents.ppo.observation import build_observation
+from belotmd.game.belief import belief_matrix
 
 MY_ID = "1000003"
 
@@ -122,10 +122,8 @@ def test_sync_smoke():
     assert len(env.graveyard) == 0
     assert env.bolts_by_team == [0, 0]              # history never scored
 
-    obs, gobs, mask = build_observation(env, my_pos, sync.match_scores)
-    assert obs.shape == (513,) and gobs.shape == (332,)
-    assert not np.isnan(obs).any() and not np.isnan(gobs).any()
-    assert not mask.any()                           # not our turn
+    assert env.current_player != my_pos              # not our turn
+    assert not np.isnan(belief_matrix(env, my_pos)).any()
 
     # Idempotency: identical frame is a strict no-op
     sync.sync(FRAME1, MY_ID)
@@ -178,12 +176,11 @@ def test_sync_smoke():
     assert env.bolts_by_team == [1, 0]
     assert sync.match_scores == [25, 27]
 
-    obs, gobs, mask = build_observation(env, my_pos, sync.match_scores)
-    assert obs.shape == (513,) and gobs.shape == (332,)
-    # Bolt feature visible to the model. I'm seat 3 -> team_us = 1, so
-    # team 0's bolt appears in the *them* slot: obs[190] = bolts_them / 2.
-    assert abs(obs[190] - 0.5) < 1e-6
-    assert abs(obs[189] - 0.0) < 1e-6               # our team: no bolts
+    # Team parity: seats {0,2} are team 0 and {1,3} are team 1, so from
+    # seat 3 the bolt belongs to the opposing team.
+    us, them = my_pos % 2, 1 - (my_pos % 2)
+    assert env.bolts_by_team[them] == 1
+    assert env.bolts_by_team[us] == 0
 
     print("\n" + "=" * 60)
     print(f"SMOKE TEST PASSED  ({auditor.violations} auditor violations)")

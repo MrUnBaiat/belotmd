@@ -16,7 +16,7 @@ import numpy as np
 from belotmd.platform.sync import StateSynchronizer
 from belotmd.platform.protocol import ASCII_TO_ID
 from belotmd.audit import Auditor
-from belotmd.agents.ppo.observation import build_observation
+from belotmd.game.belief import belief_matrix
 
 MY_ID = "me"
 ME = 3                      # my seat
@@ -116,10 +116,10 @@ def test_trick_reconstruction():
     sync.sync(weird, MY_ID)
     assert sync.match_scores == [25, -10]
 
-    # Model must consume it without a TypeError (this is what crashed live)
-    obs, gobs, mask = build_observation(env, ME, sync.match_scores)
-    assert obs.shape == (513,) and gobs.shape == (332,)
-    assert not np.isnan(obs).any()
+    # A string cell must never reach an agent as a string: that TypeError
+    # is what crashed the bot live. The synchronizer coerces defensively.
+    assert all(isinstance(v, int) for v in sync.match_scores)
+    assert not np.isnan(belief_matrix(env, ME)).any()
 
     print("\n" + "=" * 60)
     print(f"RECONSTRUCTION TEST PASSED  ({auditor.violations} violations)")

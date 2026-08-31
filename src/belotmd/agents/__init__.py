@@ -1,25 +1,27 @@
 """
 Agent registry.
 
-`random` is imported eagerly (numpy only). `ppo` is registered through a thin
-shim that defers the torch import until the agent is actually built, so the
-package stays importable — and the bot stays runnable — without torch.
+Two ways an agent gets here:
+
+1. **In-process** — call `register("name")` on a factory, as `random_agent`
+   does. Fine for an agent defined in your own program.
+
+2. **Entry point** — a separately installed package declares
+
+       [project.entry-points."belotmd.agents"]
+       ppo = "my_package.agent:PPOAgent"
+
+   and `pip install my-package` makes `belot-bot --agent ppo` work with no
+   change to this library. This is how a heavyweight agent (torch, a
+   checkpoint, a search engine) stays out of the SDK's dependency tree while
+   still being a first-class citizen on the command line.
+
+Entry points are resolved lazily: the target module is imported only when
+that agent is actually built, so a broken or heavy plugin never slows down
+`--list-agents` or the bot running some other agent.
 """
 
 from .base import Agent, available, get_agent, register
 from . import random_agent  # noqa: F401  (registers "random")
-
-
-@register("ppo")
-def _build_ppo(**kwargs):
-    try:
-        from .ppo.agent import PPOAgent
-    except ImportError as exc:                       # pragma: no cover
-        raise ImportError(
-            "the 'ppo' agent needs PyTorch: pip install -e \".[ppo]\"\n"
-            "Or run with --agent random, which has no such dependency."
-        ) from exc
-    return PPOAgent(**kwargs)
-
 
 __all__ = ["Agent", "available", "get_agent", "register"]

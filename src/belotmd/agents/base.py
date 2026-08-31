@@ -37,17 +37,28 @@ class Agent(Protocol):
         """Choose an action for `seat`.
 
         `state`       a `BelotState` reconstructed from live server frames.
-                      Read-only as far as the agent is concerned.
+                      Treat as read-only.
         `seat`        our absolute seat index, 0-3.
         `match_scores` running [team0, team1] match score.
         `legal_mask`  length-38 mask of currently permitted actions. It is
                       AUTHORITATIVE: it may already be narrower than
                       `state.get_legal_actions()` because the server refused
                       an action earlier this turn. Returning a masked-out
-                      index will get the move rejected and, eventually, the
-                      seat taken over by the platform bot.
+                      index gets the move rejected and, eventually, the seat
+                      taken over by the platform bot.
 
         Return an action index with `legal_mask[action]` true.
+
+        IMPORTANT: **`state.hands` is only real for `seat`.** belot.md never reveals
+        another player's cards, so the other three entries are placeholder ids
+        with the correct *length* and meaningless contents. An agent that
+        reads them is looking at fiction.
+
+        What is genuinely known about the other hands lives in
+        `state.known_cards`, `state.impossible_cards`, `state.graveyard` and
+        `state.current_trick`. `belotmd.game.belief` turns those into a
+        probability per (opponent, card), or into a pool of unplaced cards to
+        deal out if you are sampling determinizations for a search.
         """
 
     def snapshot(self):
@@ -67,9 +78,13 @@ class Agent(Protocol):
 
 
 # --------------------------------------------------------------- registry
-# Agents are registered lazily by name so that `--agent random` never imports
-# torch, and a missing checkpoint or missing torch install produces a clear
-# message instead of an ImportError at startup.
+#
+# Agents arrive from two places: `register()` for anything defined in this
+# process, and the "belotmd.agents" entry-point group for separately installed
+# packages. Both resolve lazily, so a plugin that needs torch, a checkpoint or
+# a search engine costs nothing until someone actually asks for it.
+
+ENTRY_POINT_GROUP = "belotmd.agents"
 
 _BUILDERS = {}
 
@@ -82,15 +97,49 @@ def register(name):
     return wrap
 
 
+def _entry_points():
+    """Installed packages advertising an agent, as {name: EntryPoint}."""
+    from importlib import metadata
+
+    try:
+        eps = metadata.entry_points()
+        # Python 3.10+ has select(); 3.9 returns a plain dict of groups.
+        group = (eps.select(group=ENTRY_POINT_GROUP)
+                 if hasattr(eps, "select") else eps.get(ENTRY_POINT_GROUP, []))
+    except Exception:                                  # pragma: no cover
+        return {}
+    return {ep.name: ep for ep in group}
+
+
 def available():
-    """Registered agent names, sorted."""
-    return sorted(_BUILDERS)
+    """Every agent name we can build, from both sources, sorted."""
+    return sorted(set(_BUILDERS) | set(_entry_points()))
 
 
 def get_agent(name, **kwargs):
-    """Build the named agent. Extra kwargs go to its factory."""
-    if name not in _BUILDERS:
-        raise ValueError(
-            f"unknown agent {name!r}; available: {', '.join(available())}"
-        )
-    return _BUILDERS[name](**kwargs)
+    """Build the named agent. Extra kwargs are passed to its factory.
+
+    An agent registered in-process wins over an entry point of the same name,
+    so a program can always override a plugin it has installed.
+    """
+    if name in _BUILDERS:
+        return _BUILDERS[name](**kwargs)
+
+    entry = _entry_points().get(name)
+    if entry is not None:
+        try:
+            factory = entry.load()
+        except Exception as exc:
+            raise ImportError(
+                f"the {name!r} agent is installed but failed to load "
+                f"({entry.value}): {type(exc).__name__}: {exc}"
+            ) from exc
+        return factory(**kwargs)
+
+    names = available()
+    raise ValueError(
+        f"unknown agent {name!r}; available: {', '.join(names) or '(none)'}.\n"
+        f"Agents from other packages are discovered through the "
+        f"{ENTRY_POINT_GROUP!r} entry-point group -- check that the package "
+        f"providing {name!r} is installed in this environment."
+    )

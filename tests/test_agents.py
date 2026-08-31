@@ -9,24 +9,47 @@ may ever return an action the mask forbids.
 import numpy as np
 import pytest
 
-from belotmd.agents import available, get_agent
+from belotmd.agents import available, get_agent, register
+from belotmd.agents.base import _BUILDERS
 from belotmd.game import actions
 from belotmd.game.state import BelotState
 
 
-def test_registry_lists_both_agents():
+def test_registry_lists_the_bundled_agent():
     assert "random" in available()
-    assert "ppo" in available()
 
 
-def test_unknown_agent_names_the_alternatives():
+def test_unknown_agent_names_the_alternatives_and_the_entry_point_group():
     with pytest.raises(ValueError) as exc:
         get_agent("nope")
-    assert "random" in str(exc.value)
+    message = str(exc.value)
+    assert "random" in message
+    assert "belotmd.agents" in message, "should point at the plugin mechanism"
 
 
-def test_random_agent_needs_no_torch():
-    """The whole point of the fallback: importable and usable on its own."""
+def test_in_process_registration_beats_an_entry_point():
+    """A program must always be able to override a plugin it has installed."""
+    sentinel = object()
+    register("test-override")(lambda **kw: sentinel)
+    try:
+        assert get_agent("test-override") is sentinel
+        assert "test-override" in available()
+    finally:
+        _BUILDERS.pop("test-override", None)
+
+
+def test_agent_kwargs_reach_the_factory():
+    seen = {}
+    register("test-kwargs")(lambda **kw: seen.update(kw) or object())
+    try:
+        get_agent("test-kwargs", checkpoint="w.pt", depth="3")
+        assert seen == {"checkpoint": "w.pt", "depth": "3"}
+    finally:
+        _BUILDERS.pop("test-kwargs", None)
+
+
+def test_random_agent_is_dependency_light():
+    """The bundled agent must work with numpy alone."""
     agent = get_agent("random", seed=0)
     assert agent.name == "random"
     # Stateless contract: reset/snapshot/restore must all be safe no-ops.
