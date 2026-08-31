@@ -1,3 +1,11 @@
+"""
+client.py — Python end of the Node bridge. Message plumbing only.
+
+Owns the `node bridge.js` subprocess, the local WebSocket to it, and the
+outgoing message vocabulary. It holds no game state: raw frames go straight
+to the callbacks in arrival order.
+"""
+
 import asyncio
 import json
 import os
@@ -5,18 +13,9 @@ import subprocess
 import time
 import websockets
 
-CHAR_TO_CARD = {
-    "y": "7_diamonds", "z": "8_diamonds", "a": "9_diamonds", "b": "10_diamonds",
-    "c": "J_diamonds", "d": "Q_diamonds", "e": "K_diamonds", "f": "A_diamonds",
-    "A": "7_hearts", "B": "8_hearts", "g": "9_hearts", "h": "10_hearts",
-    "i": "J_hearts", "j": "Q_hearts", "k": "K_hearts", "l": "A_hearts",
-    "C": "7_clubs", "D": "8_clubs", "m": "9_clubs", "n": "10_clubs",
-    "o": "J_clubs", "p": "Q_clubs", "q": "K_clubs", "r": "A_clubs",
-    "E": "7_spades", "F": "8_spades", "s": "9_spades", "t": "10_spades",
-    "u": "J_spades", "v": "Q_spades", "w": "K_spades", "x": "A_spades",
-}
+from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
+                       LEAVE_POSITION_CHANGED, SUIT_TO_INT, TRUMP_CHOOSE_1)
 
-SUIT_TO_INT = {"diamonds": 1, "hearts": 2, "clubs": 3, "spades": 4}
 
 class BelotClient:
     def __init__(self, cookies: str, bridge_port: int = 8765):
@@ -28,6 +27,7 @@ class BelotClient:
         self.room_id = None
         self._queue = None
         self._consumer = None
+        self._match_started = False
 
     # How long to wait for `node bridge.js` to bind BRIDGE_PORT.
     DAEMON_TIMEOUT_S = 15.0
@@ -112,6 +112,8 @@ class BelotClient:
                     # legal mask and silently dropping our turn.
                     # It also leaked the task -- asyncio only keeps a weak
                     # reference, so an un-stored task can be GC'd mid-flight.
+                    if (msg.get("data") or {}).get("currentPhase", 0) >= TRUMP_CHOOSE_1:
+                        self._match_started = True
                     await self._queue.put(("STATE", msg["data"]))
 
                 elif event == "MESSAGE" and on_message_callback:
@@ -123,7 +125,24 @@ class BelotClient:
                     print(f"[SDK Error]: {msg.get('message') or msg.get('code')}")
 
                 elif event == "LEAVE":
-                    print(f"[SDK] Left room session ({msg.get('code')}).")
+                    code = msg.get("code")
+                    label = LEAVE_NAMES.get(code, "UNKNOWN")
+                    if code == LEAVE_POSITION_CHANGED and not self._match_started:
+                        print(f"[SDK] {label} ({code}) in the lobby: "
+                              f"rejoining...")
+                        await ws.send(json.dumps({"action": "CONNECT",
+                                                  "cookies": self.cookies}))
+                        continue
+                    if code == LEAVE_POSITION_CHANGED:
+                        # Cheap assertion on the platform invariant. If this
+                        # ever fires, seats moved mid-match and every
+                        # seat-indexed belief (known_cards, impossible_cards,
+                        # hands, team parity) now describes the wrong player --
+                        # stopping is correct, reconnecting would not be.
+                        print(f"[SDK][WARN] {label} ({code}) AFTER play began "
+                              f"-- not supposed to happen; stopping rather "
+                              f"than resuming on stale seat state.")
+                    print(f"[SDK] Left room session: {label} ({code}).")
                     break
 
             await self._queue.put((None, None))     # drain sentinel

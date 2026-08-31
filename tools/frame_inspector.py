@@ -98,25 +98,37 @@ def h(title):
 
 def split_sessions(recs):
     """FrameRecorder opens frames.jsonl in APPEND mode, so one file can hold
-    several matches. Split on gameStartTime, a long time gap, or a scoreTable
-    that shrinks."""
+    several matches. A boundary is a scoreTable that SHRINKS (a fresh match
+    starts with an empty table and only ever grows) or a long wall-clock gap
+    (the process was restarted).
+
+    NOT gameStartTime. It looked like the obvious key and it is not stable
+    within a single match -- observed live:
+
+        lobby, gathering players   gameStartTime 1785924621
+        lobby, more players        gameStartTime 1785924641
+        phase 2, deal begins       gameStartTime 1785924653
+        phase 14, match over       gameStartTime 1785925141
+
+    Using it split one ordinary match into three "sessions": a 10-frame lobby
+    fragment, the match, and a 2-frame MATCH_END fragment. The fragment then
+    held a full 7-row scoreTable but only one roundTotals, which the row/b
+    pairing below mis-aligned into a bogus MISMATCH. Two bugs feeding each
+    other."""
     sessions, cur = [], []
-    prev_gst = prev_t = prev_rows = None
+    prev_t = prev_rows = None
     for r in recs:
         st = r.get("state", {})
-        gst, t = st.get("gameStartTime"), r.get("t")
+        t = r.get("t")
         rows = len(jparse(st.get("scoreTable", "[]"), []) or [])
         boundary = (
-            (prev_gst is not None and gst is not None and gst != prev_gst)
-            or (prev_t is not None and t is not None and t - prev_t > 600)
+            (prev_t is not None and t is not None and t - prev_t > 600)
             or (prev_rows is not None and rows < prev_rows)
         )
         if boundary and cur:
             sessions.append(cur)
             cur = []
         cur.append(r)
-        if gst is not None:
-            prev_gst = gst
         prev_t, prev_rows = t, rows
     if cur:
         sessions.append(cur)
@@ -166,6 +178,17 @@ def sec_scoring(recs, base):
         if isinstance(rt, list) and len(rt) == 2:
             bs.append((rt[0].get("b"), rt[1].get("b")))
 
+    # roundTotals.b is published once per hand, alongside the row. If the
+    # capture starts mid-match we have FEWER b's than rows, and the b's we do
+    # have belong to the LAST rows -- so align from the end. Pairing from the
+    # front produced a false MISMATCH on a mid-match fragment.
+    offset = len(table) - len(bs)
+    if offset < 0:
+        print(f"  (more roundTotals ({len(bs)}) than table rows "
+              f"({len(table)}) -- alignment unreliable, skipping the "
+              f"delta cross-check)")
+        bs, offset = [], len(table)
+
     print(f"\n  {'hand':>4}  {'row':<22} {'cumulative':>14} {'delta':>12} "
           f"{'roundTotals.b':>16}")
     scores, bolts, bad = [0, 0], [0, 0], 0
@@ -187,19 +210,25 @@ def sec_scoring(recs, base):
                 except (TypeError, ValueError):
                     pass
         delta = (scores[0] - prev[0], scores[1] - prev[1])
-        b = bs[i] if i < len(bs) else (None, None)
+        j = i - offset
+        b = bs[j] if 0 <= j < len(bs) else (None, None)
         flag = ""
         for t in (0, 1):
             if isinstance(b[t], (int, float)) and b[t] != delta[t]:
                 flag, bad = "  <-- MISMATCH", bad + 1
         print(f"  {i+1:>4}  {str(row):<22} {str(scores):>14} {str(delta):>12} "
               f"{str(b):>16}{flag}")
+    checked = min(len(bs), len(table))
     if bad:
         finding("1", f"{bad} hand(s) where the scoreTable delta disagrees with "
                      f"roundTotals.b -- the scoring model is wrong somewhere")
+    elif checked:
+        print(f"\n  {checked} of {len(table)} hand(s) cross-checked against "
+              f"roundTotals.b, all reconcile (incl. the -10 third-bolt "
+              f"penalty)")
     else:
-        print(f"\n  all {len(table)} hand(s) reconcile "
-              f"(including the -10 third-bolt penalty)")
+        print(f"\n  no roundTotals in this session -- table walked but not "
+              f"cross-checked")
     print(f"  final cumulative {scores}, bolt counters {bolts}")
 
 
@@ -355,26 +384,53 @@ def sec_cancelled(recs, base):
 def sec_combos(recs, base):
     h("5. combinations offered to us vs declared")
     my_pid = recs[0].get("pid")
-    mine, theirs, ours_declared = Counter(), Counter(), Counter()
+    # Count OFFER WINDOWS (contiguous runs), not frames. combinationsCanShow
+    # persists for a run of frames and the raw frame count says nothing about
+    # how many times we were actually asked.
+    windows, widths, cur, run = [], [], None, 0
+    theirs, ours_declared = Counter(), set()
     for r in recs:
         for p in r["state"].get("players", []):
             is_me = str(p.get("id")) == str(my_pid)
             v = p.get("combinationsCanShow") or ""
-            if v:
-                (mine if is_me else theirs)[v] += 1
+            if is_me:
+                if v == cur:
+                    run += 1 if v else 0
+                else:
+                    if cur:
+                        windows.append(cur)
+                        widths.append(run)
+                    cur, run = v, 1 if v else 0
+            elif v:
+                theirs[v] += 1
             d = p.get("combinations") or ""
             if d and is_me:
-                ours_declared[d] += 1
-    print(f"  our seat ({my_pid}) was OFFERED : {dict(mine) or 'never'}")
-    print(f"  our seat DECLARED              : {dict(ours_declared) or 'never'}")
+                ours_declared.add(d)
+    if cur:
+        windows.append(cur)
+        widths.append(run)
+    print(f"  our seat ({my_pid}) OFFER WINDOWS: "
+          f"{dict(Counter(windows)) or 'never'}")
+    print(f"  our seat DECLARED (distinct)   : "
+          f"{sorted(ours_declared) or 'never'}")
     print(f"  opponents were offered         : {dict(theirs) or 'never'}")
-    claims = sorted({k.split('|')[-1] for k in mine if k[:1] in "6789"})
+    if widths:
+        print(f"  offer window width, frames: min={min(widths)} "
+              f"max={max(widths)} ({widths})")
+        if min(widths) <= 1:
+            finding("5", f"an offer appeared in a SINGLE frame "
+                         f"(widths {widths}). combinationsCanShow is not a "
+                         f"latched field -- miss that one frame and the "
+                         f"declaration is lost silently. Declarations are "
+                         f"worth 20-200 points each.")
+    offers = set(windows)
+    claims = sorted({k.split('|')[-1] for k in offers if k[:1] in "6789"})
     if claims:
         print(f"  claim-type offers: {claims} "
               f"(6=LESS_THAN_14 7=BELOT 8=WIN_ALL 9=SURRENDER_BT)")
         print("  these are withheld by policy -- declining is intentional, "
               "not a stall.")
-    never = sorted(set(mine) - set(ours_declared))
+    never = sorted(offers - ours_declared)
     if never:
         print(f"  offered but never declared: {never}")
         print("  check AUTO_DECLARE switches (four 7s/8s, WIN_ALL, "

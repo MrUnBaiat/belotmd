@@ -1,76 +1,49 @@
 """
-sync_auditor.py — verification layer for the live Belot bot.
+audit.py — verification layer for the live bot.
 
-Three capabilities:
+Four capabilities:
   1. FrameRecorder  — append every raw STATE frame to a JSONL file, so any
      bug seen live can be replayed offline, deterministically, forever.
-  2. Auditor.check  — hard invariants on the synchronized env + observation
-     after every sync. Violations are logged, never raised: the bot keeps
-     playing while you collect evidence.
+  2. Auditor.check  — hard invariants on the synchronized state after every
+     sync. Violations are logged, never raised: the bot keeps playing while
+     you collect evidence.
   3. Auditor probes — automatic evidence collection for the still-unverified
      server semantics (lastCards ordering, trumpWasPlayed meaning, score
      column mapping, points-include-combos, combination flow).
   4. replay()       — run a recorded JSONL through a fresh StateSynchronizer
      and report every violation with its frame number.
 
-Usage (live), in bot_agent.on_state_update right after sync():
-
-    if AUDIT:
-        self.recorder.record(raw_state, my_player_id)
-        self.auditor.check(self.sync_engine, raw_state)
+Usage (live) is wired up by `bot.py` whenever audit mode is on.
 
 Usage (offline):
 
-    python -c "import sync_auditor; sync_auditor.replay('frames.jsonl')"
+    python -c "from belotmd.audit import replay; replay('frames.jsonl')"
+
+For a second opinion that shares no code with the synchronizer at all, see
+tools/frame_inspector.py.
 """
 
 import json
 import time
 import numpy as np
 
-import combinations as combo
+from .game import combinations as combo
+from .platform.protocol import ASCII_TO_ID, CHAR_TO_CARD, ID_TO_ASCII
+from .platform.sync import _bolt_marker, _last_cards_str, _to_int
 
-from observation import build_observation
-from belot_sync import (ASCII_TO_ID, ID_TO_ASCII, _last_cards_str,
-                        _to_int, _bolt_marker)
-from client import CHAR_TO_CARD
+# The belief-matrix checks read the reference agent's observation encoding.
+# It is numpy-only (no torch), but it is still an *agent* concern, so a
+# missing encoder downgrades those checks instead of breaking the auditor.
+try:
+    from .agents.ppo.observation import build_observation
+except ImportError:                                   # pragma: no cover
+    build_observation = None
 
-# Local-obs layout offsets (must mirror observation.py exactly):
+# Local-obs layout offsets (must mirror agents/ppo/observation.py exactly):
 # hand 0:32 | faceup 32:64 | trump 64:69 | declarer 69:74 | phase 74:77 |
 # cur trick 77:185 | stats 185:191 | dealer 191:195 | last trick 195:339 |
 # BELIEF 339:435 | trick# 435:443 | mask 443:481 | graveyard 481:513
 BELIEF_SLICE = slice(339, 435)
-
-
-def verify_observation_patch(verbose=True):
-    """Confirm observation.py excludes known cards from every candidate row.
-
-    belot_sync pins declared and swapped cards with known_cards alone. On an
-    unpatched observation.py those pins leak ~0.49 onto each other opponent,
-    so the belief matrix would silently degrade instead of improving.
-    """
-    from env import BelotEnv
-    from observation import build_observation
-    e = BelotEnv()
-    e.phase = "PLAYING"; e.trump = 2; e.declarer = 1; e.dealer = 3
-    e.current_player = 0; e.done = False; e.tricks_played = 0
-    e.hands = [[0, 1, 2, 3]] + [list(range(4, 8)) for _ in range(3)]
-    e.graveyard = []; e.current_trick = []
-    e.known_cards[:] = False; e.impossible_cards[:] = False
-    e.known_cards[2, 20] = True
-    bel = build_observation(e, 0, [0, 0])[0][339:435].reshape(3, 32)
-    ok = bel[0, 20] == 0.0 and bel[2, 20] == 0.0
-    if not ok:
-        print("=" * 68)
-        print("[Audit][CRITICAL] observation.py is missing the known-card "
-              "exclusion.\n                  Pinned cards will leak "
-              f"{bel[0, 20]:.2f} of phantom mass onto each\n"
-              "                  other opponent. Update observation.py.")
-        print("=" * 68)
-    elif verbose:
-        print("[Audit] observation.py belief exclusion verified "
-              "(pins are exclusive).")
-    return ok
 
 
 class FrameRecorder:
@@ -138,7 +111,7 @@ class Auditor:
             self._probed_last_cards = ""
             self._trick_log = []
             self._trump_bid_sampled = False
-        env = sync.env
+        env = sync.state
         me = sync.my_pos
         if me is None:
             return
@@ -228,15 +201,16 @@ class Auditor:
                            f"{CHAR_TO_CARD.get(ch)} but server says {dbg}")
 
         # ---- observation-level checks at our decision points ---------
-        if env.current_player == me and phase in (6, 7, 10) and not env.done:
+        if (build_observation is not None and env.current_player == me
+                and phase in (6, 7, 10) and not env.done):
             obs, gobs, mask = build_observation(env, me, sync.match_scores)
             if np.isnan(obs).any() or np.isnan(gobs).any():
                 self._emit("VIOLATION", "NaN in observation")
             if not mask.any() and env.hands[me]:
                 # An empty mask with an EMPTY hand is legitimate: the server
-                # reports phase 10 with activePlayer set for one more frame
-                # after the last card of the last trick. Flagging it was
-                # noise that masked real signal (PLATFORM_NOTES §14.7).
+                # reports phase 10 with activePlayer still set for one more
+                # frame after the last card of the last trick. Flagging that
+                # was pure noise, and noise masks real signal.
                 self._emit("VIOLATION", "empty legal mask on our turn")
 
             bel = obs[BELIEF_SLICE].reshape(3, 32)
@@ -295,12 +269,12 @@ class Auditor:
         it asserts the property still holds and cross-checks the two
         independent reconstruction paths (cardOrder vs leader-chain)."""
         lc = _last_cards_str(raw_state)
-        if not lc or lc == self._probed_last_cards or len(sync.env.last_trick) != 4:
+        if not lc or lc == self._probed_last_cards or len(sync.state.last_trick) != 4:
             return
         self._probed_last_cards = lc
-        self._trick_log.append((sync.env.tricks_played, list(sync.env.last_trick)))
+        self._trick_log.append((sync.state.tricks_played, list(sync.state.last_trick)))
 
-        seat_map = dict(sync.env.last_trick)
+        seat_map = dict(sync.state.last_trick)
         by_seat = "".join(ID_TO_ASCII[seat_map[s]] for s in sorted(seat_map))
         if by_seat != lc:
             self._emit("VIOLATION",
@@ -310,31 +284,31 @@ class Auditor:
 
         # Cross-check: chronological order must be the seat order rotated by
         # the leader, and the leader must be the previous trick's winner.
-        leader = sync.env.last_trick[0][0]
+        leader = sync.state.last_trick[0][0]
         expect = [((leader + k) % 4) for k in range(4)]
-        if [s for s, _ in sync.env.last_trick] != expect:
+        if [s for s, _ in sync.state.last_trick] != expect:
             self._emit("VIOLATION",
-                       f"trick seat sequence {[s for s, _ in sync.env.last_trick]} "
+                       f"trick seat sequence {[s for s, _ in sync.state.last_trick]} "
                        f"is not clockwise from leader {leader}")
         # Anchor check: the declarer leads trick 1. This is the only thing
         # the seat-index fallback depends on, and it is the one place the
         # forced-trump ("BIZON") hands could differ, since they skip bidding.
-        if (sync.env.tricks_played == 1 and sync.env.declarer is not None
+        if (sync.state.tricks_played == 1 and sync.state.declarer is not None
                 and not getattr(sync, 'degraded_hand', False)):
             # (skipped on a mid-hand join: our trick counter starts at
             #  the join point, so 'trick 1' is not the real first trick)
-            if leader != sync.env.declarer:
+            if leader != sync.state.declarer:
                 self._emit("VIOLATION",
                            f"trick 1 led by seat {leader}, but declarer is "
-                           f"{sync.env.declarer} -- leader-chain anchor wrong; "
+                           f"{sync.state.declarer} -- leader-chain anchor wrong; "
                            f"the seatIndex fallback would misorder tricks")
         if self._expected_leader is not None and leader != self._expected_leader:
             self._emit("VIOLATION",
                        f"leader chain broken: expected {self._expected_leader} "
                        f"(prev trick winner), observed {leader}")
-        self._expected_leader = sync._trick_winner(sync.env.last_trick)
+        self._expected_leader = sync._trick_winner(sync.state.last_trick)
         self._emit("INFO",
-                   f"trick {sync.env.tricks_played} ok "
+                   f"trick {sync.state.tricks_played} ok "
                    f"(leader {leader}, winner {self._expected_leader}, "
                    f"src {sync.last_trick_source})")
 
@@ -344,27 +318,27 @@ class Auditor:
         hand boundaries. Definitive test: sample it during BIDDING, before a
         single card of the new hand exists. True there proves staleness."""
         flag = bool(raw_state.get("trumpWasPlayed", False))
-        if sync.env.phase == "BIDDING" and not self._trump_bid_sampled:
+        if sync.state.phase == "BIDDING" and not self._trump_bid_sampled:
             self._trump_bid_sampled = True
             self._emit("PROBE",
                        f"trumpWasPlayed during BIDDING = {flag} -> "
                        + ("STALE across hands (server field unusable; local "
                           "derivation in use)" if flag else
                           "resets correctly (field trustworthy)"))
-        if sync.env.phase != "BIDDING":
+        if sync.state.phase != "BIDDING":
             self._trump_bid_sampled = False
 
         # Compare server flag against our local derivation every play frame.
-        if sync.env.phase == "PLAYING" and flag != sync.env.declarer_has_played_trump:
-            key = (sync.env.tricks_played, flag, sync.env.declarer_has_played_trump)
+        if sync.state.phase == "PLAYING" and flag != sync.state.declarer_has_played_trump:
+            key = (sync.state.tricks_played, flag, sync.state.declarer_has_played_trump)
             if key not in self._trump_divergences:
                 self._trump_divergences.add(key)
                 self._emit("PROBE",
-                           f"trick {sync.env.tricks_played}: server "
+                           f"trick {sync.state.tricks_played}: server "
                            f"trumpWasPlayed={flag} vs locally-derived "
                            f"declarer_has_played_trump="
-                           f"{sync.env.declarer_has_played_trump} "
-                           f"(declarer={sync.env.declarer})")
+                           f"{sync.state.declarer_has_played_trump} "
+                           f"(declarer={sync.state.declarer})")
         self._trump_flag_prev = flag
 
     def _probe_score_columns(self, sync, raw_state):
@@ -407,7 +381,7 @@ class Auditor:
                            f"round scored: cumulative deltas "
                            f"({deltas[0]},{deltas[1]}) vs b({tags[0]},{tags[1]})"
                            f" -> {verdict}; totals now "
-                           f"({cur[0]},{cur[1]}), bolts {sync.env.bolts_by_team}")
+                           f"({cur[0]},{cur[1]}), bolts {sync.state.bolts_by_team}")
         self._prev_score_rows = rows
 
     def _probe_points_semantics(self, sync, raw_state):
@@ -418,7 +392,7 @@ class Auditor:
         players = raw_state.get("players", [])
         if len(players) != 4:
             return
-        if sync.env.phase == "PLAYING":
+        if sync.state.phase == "PLAYING":
             tot = sum(_to_int(p.get("points", 0)) for p in players)
             if tot > 162 and not self._points_cap_flagged:
                 self._points_cap_flagged = True
@@ -456,8 +430,8 @@ class Auditor:
         # a hand boundary is simply the next deal's flipped card.
         prev = self._last_top if hid == self._last_top_hand else ""
         self._last_top, self._last_top_hand = top, hid
-        if prev and sync.env.face_up_card is not None:
-            frozen = ID_TO_ASCII.get(sync.env.face_up_card)
+        if prev and sync.state.face_up_card is not None:
+            frozen = ID_TO_ASCII.get(sync.state.face_up_card)
             if top != frozen:
                 self._emit("PROBE",
                            f"topCard rewritten '{prev}' -> '{top}' while the "
@@ -477,7 +451,7 @@ class Auditor:
         because the face-up card is going to our partner.
         """
         phase = raw_state.get("currentPhase")
-        env = sync.env
+        env = sync.state
         if phase != 8:
             if self._in_swap_window and phase is not None and phase > 8:
                 self._in_swap_window = False
@@ -605,8 +579,9 @@ class Auditor:
 # ----------------------------------------------------------------------
 def replay(path, my_player_id=None, verbose=True):
     """Deterministically re-run recorded frames through a fresh synchronizer.
-    Iterate on belot_sync.py offline instead of burning live games."""
-    from belot_sync import StateSynchronizer
+    Iterate on the sync layer offline instead of burning live games."""
+    from .platform.sync import StateSynchronizer
+
     sync = StateSynchronizer()
     auditor = Auditor(verbose=verbose)
     frames = 0
@@ -621,6 +596,6 @@ def replay(path, my_player_id=None, verbose=True):
     return auditor
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":       # python -m belotmd.audit [frames.jsonl]
     import sys
     replay(sys.argv[1] if len(sys.argv) > 1 else "frames.jsonl")

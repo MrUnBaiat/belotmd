@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "belotmd"
+version = "1.0.0"
+description = "A bot that plays Belot against real players on belot.md"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["belot", "belote", "card-game", "bot", "reinforcement-learning", "colyseus"]
+
+dependencies = [
+    "numpy>=1.24",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+# The reference recurrent-MAPPO agent. Everything else — the bridge, the
+# synchronizer, the auditor, the random agent — runs without it.
+ppo = ["torch>=2.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+belot-bot = "belotmd.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+belotmd = ["platform/bridge.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

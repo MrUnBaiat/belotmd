@@ -1,10 +1,15 @@
 """
-Single source of truth for observation construction.
+observation.py — the reference agent's observation encoding.
 
-This is a faithful, side-effect-free port of `BelotAECEnv.observe()`. It takes a
-raw `BelotEnv` plus the per-env running match score and returns the three arrays
-the policy needs. Keeping it standalone lets the vectorized driver build a batch
-of observations without spinning up the full PettingZoo AEC machinery per env.
+Turns a `BelotState` plus the running match score into the three arrays the
+recurrent MAPPO policy consumes: a (513,) local observation, a (332,)
+egocentric global observation for the critic, and a (38,) legal-action mask.
+
+GROUND TRUTH. The layout here is a faithful, side-effect-free port of the
+trainer's `BelotAECEnv.observe()`, and the checkpoint's weights depend on
+every offset in it. Changing the layout silently invalidates the trained
+model. A different architecture should bring its own encoder rather than
+edit this one — see docs/PPO_AGENT.md for the field-by-field contract.
 """
 
 import numpy as np
@@ -230,3 +235,44 @@ def build_observation(belot, abs_id, match_scores):
     assert g == 332, f"Global obs built {g} features, expected 332"
 
     return obs, g_obs, legal_mask
+
+# --------------------------------------------------------------- self-check
+BELIEF_SLICE = slice(339, 435)
+
+
+def verify_observation_contract(verbose=True):
+    """Confirm this encoder excludes known cards from every candidate row.
+
+    The synchronizer pins declared and swapped cards using `known_cards`
+    alone. If the belief matrix does not exclude a pinned card from the other
+    two candidate rows, each of them receives ~0.49 of phantom mass on a card
+    somebody else provably holds, and the column sums to ~1.97 instead of 1.0.
+    The belief state then degrades as declarations arrive instead of
+    improving — silently. Cheap to assert, so assert it at startup.
+    """
+    from ...game.state import BelotState
+
+    s = BelotState()
+    s.phase = "PLAYING"
+    s.trump, s.declarer, s.dealer = 2, 1, 3
+    s.current_player, s.done, s.tricks_played = 0, False, 0
+    s.hands = [[0, 1, 2, 3]] + [list(range(4, 8)) for _ in range(3)]
+    s.graveyard, s.current_trick = [], []
+    s.known_cards[:] = False
+    s.impossible_cards[:] = False
+    s.known_cards[2, 20] = True          # seat 2 provably holds card 20
+
+    bel = build_observation(s, 0, [0, 0])[0][BELIEF_SLICE].reshape(3, 32)
+    ok = bel[0, 20] == 0.0 and bel[2, 20] == 0.0
+    if not ok:
+        print("=" * 68)
+        print("[Agent][CRITICAL] observation.py is missing the known-card "
+              "exclusion.\n                  Pinned cards leak "
+              f"{bel[0, 20]:.2f} of phantom mass onto each\n"
+              "                  other opponent; beliefs will degrade as "
+              "declarations arrive.")
+        print("=" * 68)
+    elif verbose:
+        print("[Agent] observation belief exclusion verified "
+              "(pins are exclusive).")
+    return ok

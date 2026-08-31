@@ -1,27 +1,22 @@
+"""
+sync.py — raw belot.md state frames -> a reconstructed `BelotState`.
+
+The hard part of the project. The server publishes a partial, occasionally
+stale view of the table; this module turns a stream of those frames into a
+consistent local game state, including the belief information (voids, declared
+combinations, seven-swaps) that no single frame contains.
+
+Field-by-field trust rules are documented in docs/PLATFORM_NOTES.md.
+"""
+
 import json
 import re
 import numpy as np
-import combinations as combo
-from env import BelotEnv
 
-ASCII_TO_ID = {
-    'y': 0, 'z': 1, 'a': 2, 'b': 3, 'c': 4, 'd': 5, 'e': 6, 'f': 7,
-    'A': 8, 'B': 9, 'g': 10, 'h': 11, 'i': 12, 'j': 13, 'k': 14, 'l': 15,
-    'C': 16, 'D': 17, 'm': 18, 'n': 19, 'o': 20, 'p': 21, 'q': 22, 'r': 23,
-    'E': 24, 'F': 25, 's': 26, 't': 27, 'u': 28, 'v': 29, 'w': 30, 'x': 31
-}
-
-ID_TO_ASCII = {v: k for k, v in ASCII_TO_ID.items()}
-
-# Authoritative phase enum (gameplay.js):
-#  0 NOT_STARTED  1 STARTED   2 PUSH_CARDS  3 AFTER_PUSH_CARD
-#  4 ANIMATION_FIRST_DEAL     5 DEAL_CARDS_1
-#  6 TRUMP_CHOOSE_1  7 TRUMP_CHOOSE_2  8 SWAP_SEVEN  9 DEAL_CARDS_2
-# 10 PLAY  11 HAND_TAKE  12 WIN_ALL_HANDS  13 ROUND_ENDED  14 GAME_ENDED
-DEAL_PHASES  = (0, 1, 2, 3, 4, 5)  # ready / cut / first deal
-BID_PHASES   = (6, 7)              # bidding round 1 / round 2
-SWAP_PHASE   = 8                   # seven-swap window (round-1 accept only)
-END_PHASES   = (13, 14)            # hand scored / match finished
+from ..game import combinations as combo
+from ..game.state import BelotState
+from .protocol import (ASCII_TO_ID, BID_PHASES, DEAL_PHASES,  # noqa: F401
+                       END_PHASES, ID_TO_ASCII, SWAP_PHASE)
 
 
 _BOLT_RE = re.compile(r"^\s*BT[-_ ]?(\d+)\s*$", re.IGNORECASE)
@@ -65,7 +60,14 @@ def _last_cards_str(raw_state) -> str:
 
 class StateSynchronizer:
     def __init__(self):
-        self.env = BelotEnv()
+        self.state = BelotState()
+        # BelotState() deals a fictional random hand, and ~1/8 of the time
+        # (face-up Jack) self-finalizes bidding, leaving a belief pin behind.
+        # A frame arriving before the first _start_new_hand() would then see a
+        # pin for a card nobody holds -- a warning that appeared in roughly one
+        # replay in eight and in no other. Wipe it up front so the synchronizer
+        # starts from nothing whatever the deck happened to be.
+        self._neutralize_fictional_deal()
         self.my_pos = None
         self.match_scores = [0, 0]
 
@@ -116,7 +118,7 @@ class StateSynchronizer:
         fictional trump/declarer, 8-card hands. The live deal comes from the
         server, so wipe every artifact. bolts_by_team and dealer survive
         (matching env.reset semantics)."""
-        e = self.env
+        e = self.state
         e.deck = []
         e.hands = [[] for _ in range(4)]
         e.face_up_card = None
@@ -142,7 +144,7 @@ class StateSynchronizer:
         e.done = False
 
     def _start_new_hand(self, raw_state):
-        self.env.reset()
+        self.state.reset()
         self._neutralize_fictional_deal()
         self._trick_plays = {}
         # ADOPT (don't process) whatever lastCards the server still carries
@@ -169,7 +171,25 @@ class StateSynchronizer:
         straight off the marker (authoritative -- replaces the old inference
         from roundTotals.b, which never fired because b is the *string*
         'BT-N', not 0). Bolt count is taken mod 3 to match env's roll-over
-        at the third bolt."""
+        at the third bolt.
+
+        THE THIRD BOLT ALSO COSTS 10 POINTS, and the penalty is invisible in
+        scoreTable because the cell is the string 'BT-3' rather than a number.
+        Carrying the previous total forward therefore overstates the bolted
+        team by 10 until the next numeric row lands. Confirmed against a
+        captured match:
+
+            row 4  [9, 72]        -> team 0 on 9
+            row 5  ['BT-3', 88]   -> cell is a string, true total is -1
+            row 6  [2, 101]       -> roundTotals.b says +3, and -1 + 3 == 2
+
+        Without the penalty the implied delta is 2 - 9 = -7, which is what the
+        auditor flagged as 'deltas (-7,13) vs b(3,13) -> MISMATCH'. This is
+        env.py's own rule (bolts += 1; at 3, subtract 10 and reset), so the
+        counter was already right -- only the score was not.
+
+        `n % 3 == 0` catches the penalty whether the platform keeps counting
+        up (BT-3, BT-6, ...) or resets its label after every third."""
         scores, bolts = [0, 0], [0, 0]
         if not isinstance(tbl, list):
             return scores, bolts
@@ -180,6 +200,8 @@ class StateSynchronizer:
                 n = _bolt_marker(row[t])
                 if n is not None:
                     bolts[t] = n % 3        # env zeroes the counter at 3
+                    if n and n % 3 == 0:    # third bolt: -10, invisible above
+                        scores[t] -= 10
                 else:                        # score unchanged on a bolt row
                     scores[t] = _to_int(row[t], scores[t])
         return scores, bolts
@@ -201,15 +223,15 @@ class StateSynchronizer:
     def _trick_winner(self, trick):
         """Chronological trick -> winning seat. Faithful mirror of
         env._evaluate_trick's comparison logic (reuses the env's own
-        _get_card_value, so the rank tables can never drift)."""
+        card_value, so the rank tables can never drift)."""
         if len(trick) != 4:
             return None
         led_suit = trick[0][1] // 8
         best_seat, best_rank, best_is_trump = None, -1, False
         for seat, card in trick:
             suit = card // 8
-            is_trump = (self.env.trump is not None and suit == self.env.trump)
-            _, rank = self.env._get_card_value(card, is_trump)
+            is_trump = (self.state.trump is not None and suit == self.state.trump)
+            _, rank = self.state.card_value(card, is_trump)
             if not is_trump and not best_is_trump and suit == led_suit:
                 if rank > best_rank:
                     best_rank, best_seat = rank, seat
@@ -224,10 +246,10 @@ class StateSynchronizer:
         """env sets declarer_has_played_trump the moment the declarer plays a
         trump. Derived locally rather than taken from the server field, whose
         semantics differ (see the intersection note in sync())."""
-        if self.env.declarer is None or self.env.trump is None:
+        if self.state.declarer is None or self.state.trump is None:
             return
         for seat, card in trick:
-            if seat == self.env.declarer and card // 8 == self.env.trump:
+            if seat == self.state.declarer and card // 8 == self.state.trump:
                 self._declarer_trump_seen = True
 
     # ------------------------------------------------------------------ pinning
@@ -237,16 +259,16 @@ class StateSynchronizer:
         where a card genuinely changes hands mid-deal)."""
         if seat is None or not (0 <= seat <= 3) or card is None:
             return False
-        if card in self.env.graveyard:
+        if card in self.state.graveyard:
             return False
-        if any(c == card for _, c in self.env.current_trick):
+        if any(c == card for _, c in self.state.current_trick):
             return False
         if (self.my_pos is not None and seat != self.my_pos
-                and card in self.env.hands[self.my_pos]):
+                and card in self.state.hands[self.my_pos]):
             return False            # it is in OUR hand: the claim is wrong
         if exclusive:
-            self.env.known_cards[:, card] = False
-        self.env.known_cards[seat, card] = True
+            self.state.known_cards[:, card] = False
+        self.state.known_cards[seat, card] = True
         return True
 
     def apply_seven_swap(self, who, seven, top):
@@ -265,10 +287,10 @@ class StateSynchronizer:
         """
         if who is None or not (0 <= who <= 3):
             return
-        if seven is None and self.env.trump is not None:
-            seven = self.env.trump * 8                 # rank 0 == the 7
+        if seven is None and self.state.trump is not None:
+            seven = self.state.trump * 8                 # rank 0 == the 7
         if top is None:
-            top = self.env.face_up_card
+            top = self.state.face_up_card
         if seven is None or top is None or seven == top:
             return
 
@@ -284,11 +306,11 @@ class StateSynchronizer:
     def _natural_face_up_recipient(self):
         """Who would hold the face-up card with no swap: the declarer when it
         was accepted in round 1, otherwise the dealer."""
-        if self.env.face_up_card is None or self.env.trump is None:
+        if self.state.face_up_card is None or self.state.trump is None:
             return None
-        if self.env.trump == self.env.face_up_card // 8:
-            return self.env.declarer
-        return self.env.dealer
+        if self.state.trump == self.state.face_up_card // 8:
+            return self.state.declarer
+        return self.state.dealer
 
     # ------------------------------------------------------------------ combos
     def apply_combination(self, seat, value):
@@ -320,7 +342,7 @@ class StateSynchronizer:
         # than ignoring the declaration, so drop the whole thing.
         if seat == self.my_pos:
             return          # our own declaration echoed back: nothing to learn
-        mine = set(self.env.hands[self.my_pos]) if self.my_pos is not None else set()
+        mine = set(self.state.hands[self.my_pos]) if self.my_pos is not None else set()
         clash = [c for c in cards if c in mine]
         if clash:
             self.combo_conflicts += 1
@@ -329,7 +351,7 @@ class StateSynchronizer:
                   f"decoding is wrong, declaration ignored")
             return
 
-        gone = set(self.env.graveyard) | {c for _, c in self.env.current_trick}
+        gone = set(self.state.graveyard) | {c for _, c in self.state.current_trick}
         applied = [c for c in cards if c not in gone]
         applied = [c for c in applied if self._pin_known(seat, c, exclusive=False)]
         dropped = [c for c in cards if c not in applied]
@@ -352,10 +374,10 @@ class StateSynchronizer:
         for seat, card in trick[1:]:
             suit = card // 8
             if suit != led_suit:
-                self.env.impossible_cards[seat, led_suit * 8:led_suit * 8 + 8] = True
-                if self.env.trump is not None and suit != self.env.trump:
-                    t = self.env.trump
-                    self.env.impossible_cards[seat, t * 8:t * 8 + 8] = True
+                self.state.impossible_cards[seat, led_suit * 8:led_suit * 8 + 8] = True
+                if self.state.trump is not None and suit != self.state.trump:
+                    t = self.state.trump
+                    self.state.impossible_cards[seat, t * 8:t * 8 + 8] = True
 
     # ------------------------------------------------------------------ main
     def sync(self, raw_state: dict, my_player_id: str) -> int:
@@ -420,24 +442,24 @@ class StateSynchronizer:
             self._reset_for_round = cur_round
             self.degraded_hand = joined_mid
 
-        if phase in BID_PHASES and self.env.face_up_card is None:
+        if phase in BID_PHASES and self.state.face_up_card is None:
             print("[Sync][CRITICAL] entered bidding with no face-up card "
                   f"(topCard={raw_state.get('topCard')!r}); the round-2 suit "
                   "mask cannot exclude the flipped suit")
 
         # Phase mapping
         if phase in BID_PHASES:
-            self.env.phase = "BIDDING"
-            self.env.bidding_round = 1 if phase == 6 else 2
+            self.state.phase = "BIDDING"
+            self.state.bidding_round = 1 if phase == 6 else 2
         elif phase >= 10:
-            self.env.phase = "PLAYING"
+            self.state.phase = "PLAYING"
         else:
-            self.env.phase = "PRE_GAME"
-        self.env.done = phase in END_PHASES
+            self.state.phase = "PRE_GAME"
+        self.state.done = phase in END_PHASES
 
         # 3. Direct mappings -----------------------------------------------
-        self.env.dealer = raw_state.get("dealer", 0)
-        self.env.current_player = raw_state.get("activePlayer", 0)
+        self.state.dealer = raw_state.get("dealer", 0)
+        self.state.current_player = raw_state.get("activePlayer", 0)
 
         # LIVE-OBSERVED: `trump` and `declarer` carry the PREVIOUS hand's
         # values right through the deal and bidding, only updating when a bid
@@ -451,7 +473,7 @@ class StateSynchronizer:
         # bidding are over.
         declarer = raw_state.get("declarer", None)
         bidding_open = phase in DEAL_PHASES or phase in BID_PHASES
-        self.env.declarer = (None if bidding_open
+        self.state.declarer = (None if bidding_open
                              else (declarer if (declarer is not None and declarer >= 0)
                                    else None))
 
@@ -460,7 +482,7 @@ class StateSynchronizer:
         self._server_trump_flag = bool(raw_state.get("trumpWasPlayed", False))
 
         trump_val = raw_state.get("trump", -1)
-        self.env.trump = (None if bidding_open
+        self.state.trump = (None if bidding_open
                           else ((trump_val - 1) if 1 <= trump_val <= 4 else None))
 
         # LIVE-OBSERVED: `topCard` is stale from the previous hand until the
@@ -480,14 +502,14 @@ class StateSynchronizer:
                 # the previous hand for the first frames, but it settles at
                 # the real flipped card by the time cards are dealt (phase 5)
                 # and long before we ever act (phase 6).
-                self.env.face_up_card = top_id
-                self.env.face_up_suit = top_id // 8
-            elif self.env.face_up_card is None:
+                self.state.face_up_card = top_id
+                self.state.face_up_suit = top_id // 8
+            elif self.state.face_up_card is None:
                 # Joined mid-hand: adopt whatever is there. If a swap already
                 # happened this is the 7, not the flipped card -- degraded,
                 # and flagged as such.
-                self.env.face_up_card = top_id
-                self.env.face_up_suit = top_id // 8
+                self.state.face_up_card = top_id
+                self.state.face_up_suit = top_id // 8
             # From phase 8 on the value is FROZEN. A swap makes the server
             # rewrite topCard to the 7 the declarer received, and everything
             # downstream (bidding legality, the face-up feature, the swap
@@ -515,7 +537,7 @@ class StateSynchronizer:
         # Deferred to section 6b: the pin guard compares candidate cards
         # against our own hand, which is only accurate after the hands have
         # been resynced (a swap changes our hand in the very same frame).
-        entered_play = (phase >= 10 and not self.env.done
+        entered_play = (phase >= 10 and not self.state.done
                         and (prev_phase < 10 or prev_phase in END_PHASES))
 
         # 4. Trick reconstruction (per-seat merge; wipe/bundle-safe) --------
@@ -528,7 +550,7 @@ class StateSynchronizer:
                 table.append((p.get("cardOrder", 99), i, ASCII_TO_ID[ch]))
         table.sort(key=lambda x: x[0])
 
-        grave = set(self.env.graveyard)
+        grave = set(self.state.graveyard)
         for order, seat, card in table:
             if card in grave:          # stale table remnant of a resolved trick
                 continue
@@ -559,17 +581,17 @@ class StateSynchronizer:
             if len(finished) == 4:
                 # Primary: observed cardOrder (authoritative when we saw the
                 # table fill up).
-                self.env.last_trick = [(seat, card) for _, seat, card in finished]
+                self.state.last_trick = [(seat, card) for _, seat, card in finished]
                 self.last_trick_source = "cardOrder"
             elif len(by_seat) == 4 and self._next_leader is not None:
                 # Fallback: rotate seat-indexed lastCards by the known leader.
                 L = self._next_leader
-                self.env.last_trick = [((L + k) % 4, by_seat[(L + k) % 4])
+                self.state.last_trick = [((L + k) % 4, by_seat[(L + k) % 4])
                                        for k in range(4)]
                 self.last_trick_source = "seatIndex"
             else:
                 # Last resort: whatever partial evidence exists.
-                self.env.last_trick = [(seat, card) for _, seat, card in finished]
+                self.state.last_trick = [(seat, card) for _, seat, card in finished]
                 self.last_trick_source = "partial"
 
             # Void inference reads trick[0] as the LEADER. On the "partial"
@@ -579,26 +601,26 @@ class StateSynchronizer:
             # matrix for the rest of the hand. Only the two ordered paths
             # feed it. (_track_declarer_trump is order-independent.)
             if self.last_trick_source in ("cardOrder", "seatIndex"):
-                self._mark_voids(self.env.last_trick)
-            elif self.env.last_trick:
+                self._mark_voids(self.state.last_trick)
+            elif self.state.last_trick:
                 print("[Sync][WARN] last trick reconstructed from partial "
                       "evidence; skipping void inference to avoid poisoning "
                       "the belief state")
-            self._track_declarer_trump(self.env.last_trick)
+            self._track_declarer_trump(self.state.last_trick)
 
             # Chain the leader for the next trick.
-            winner = self._trick_winner(self.env.last_trick)
+            winner = self._trick_winner(self.state.last_trick)
             if winner is not None:
                 self._next_leader = winner
 
             # Graveyard sourced from lastCards itself (never a partial cache),
             # so content stays complete even if table frames were lost.
             for card in completed:
-                if card not in self.env.graveyard:
-                    self.env.graveyard.append(card)
-                self.env.known_cards[:, card] = False
+                if card not in self.state.graveyard:
+                    self.state.graveyard.append(card)
+                self.state.known_cards[:, card] = False
 
-            self.env.tricks_played += 1
+            self.state.tricks_played += 1
             self._trick_plays = {
                 seat: (order, card)
                 for seat, (order, card) in self._trick_plays.items()
@@ -608,13 +630,13 @@ class StateSynchronizer:
 
         # Current trick = surviving plays, chronological by cardOrder
         cur = sorted((o, s, c) for s, (o, c) in self._trick_plays.items())
-        self.env.current_trick = [(s, c) for _, s, c in cur]
-        self._mark_voids(self.env.current_trick)             # mid-trick, live
-        self._track_declarer_trump(self.env.current_trick)
-        if self._next_leader is None and self.env.current_trick:
-            self._next_leader = self.env.current_trick[0][0]
-        for seat, card in self.env.current_trick:
-            self.env.known_cards[seat, card] = False         # env clears on play
+        self.state.current_trick = [(s, c) for _, s, c in cur]
+        self._mark_voids(self.state.current_trick)             # mid-trick, live
+        self._track_declarer_trump(self.state.current_trick)
+        if self._next_leader is None and self.state.current_trick:
+            self._next_leader = self.state.current_trick[0][0]
+        for seat, card in self.state.current_trick:
+            self.state.known_cards[seat, card] = False         # env clears on play
 
         # declarer_has_played_trump: locally derived (mirrors env), with the
         # server flag as fallback only when we joined mid-hand and genuinely
@@ -628,7 +650,7 @@ class StateSynchronizer:
         # re-dispatch. Use the intersection -- never more permissive than the
         # server, never more permissive than training. (Only affects
         # non-declarers; env exempts the declarer from the restriction.)
-        self.env.declarer_has_played_trump = bool(
+        self.state.declarer_has_played_trump = bool(
             self._declarer_trump_seen and self._server_trump_flag
         ) or (self._server_trump_flag if self.degraded_hand else False)
 
@@ -640,24 +662,24 @@ class StateSynchronizer:
         # Once the hand is scored (phase 13/14) the server starts dealing the
         # NEXT hand into `cards`. Freeze the finished hand instead of letting
         # new cards contaminate it; the reset at the deal rebuilds everything.
-        for i, p in enumerate(players if not self.env.done else []):
+        for i, p in enumerate(players if not self.state.done else []):
             cards_field = p.get("cards") or ""
             if cards_field:
-                self.env.hands[i] = [ASCII_TO_ID[c] for c in cards_field
+                self.state.hands[i] = [ASCII_TO_ID[c] for c in cards_field
                                      if c in ASCII_TO_ID]
             elif i == self.my_pos:
-                self.env.hands[i] = []
+                self.state.hands[i] = []
             else:
                 n = p.get("numCards")
                 if n is None:  # tertiary fallback: infer from trick progress
-                    if self.env.phase == "BIDDING":
+                    if self.state.phase == "BIDDING":
                         n = 5
-                    elif self.env.phase == "PLAYING":
-                        played_now = any(s == i for s, _ in self.env.current_trick)
-                        n = 8 - self.env.tricks_played - (1 if played_now else 0)
+                    elif self.state.phase == "PLAYING":
+                        played_now = any(s == i for s, _ in self.state.current_trick)
+                        n = 8 - self.state.tricks_played - (1 if played_now else 0)
                     else:
                         n = 0
-                self.env.hands[i] = list(range(max(0, int(n))))  # dummy ids
+                self.state.hands[i] = list(range(max(0, int(n))))  # dummy ids
 
         # A seat cannot hold more certainties than cards. This goes wrong when
         # a whole trick's frames are lost: pins are only cleared for cards seen
@@ -667,13 +689,13 @@ class StateSynchronizer:
         # provably wrong and we cannot tell which, so drop them all -- a false
         # 1.0 is worse than no pin (same rule apply_combination follows).
         for i in range(4):
-            n_pins = int(self.env.known_cards[i].sum())
-            if n_pins > len(self.env.hands[i]):
+            n_pins = int(self.state.known_cards[i].sum())
+            if n_pins > len(self.state.hands[i]):
                 print(f"[Sync][WARN] seat {i} has {n_pins} pinned cards but "
-                      f"only {len(self.env.hands[i])} in hand (dropped trick "
+                      f"only {len(self.state.hands[i])} in hand (dropped trick "
                       f"frames?); clearing its pins rather than feeding the "
                       f"model a contradiction")
-                self.env.known_cards[i, :] = False
+                self.state.known_cards[i, :] = False
 
         # known_cards: face-up recipient, edge-triggered on entry into play.
         # (prev in END_PHASES covers a dropped-bidding jump 14 -> 10.)
@@ -689,8 +711,8 @@ class StateSynchronizer:
                     if natural is not None and natural != who:
                         self._pin_known(natural, seven)
                 elif (self.my_pos is not None
-                      and top_id in self.env.hands[self.my_pos]
-                      and self.env.trump == top_id // 8):
+                      and top_id in self.state.hands[self.my_pos]
+                      and self.state.trump == top_id // 8):
                     # Round-1 accept only: phase 8 (and therefore any swap)
                     # exists solely on that path, so a round-2 pick can never
                     # be mistaken for a swap just because we happen to hold
@@ -699,8 +721,8 @@ class StateSynchronizer:
                         self.apply_seven_swap(self.my_pos, None, top_id)
                     else:
                         self._pin_known(self.my_pos, top_id)
-                elif natural == self.my_pos and self.env.trump is not None \
-                        and self.env.trump * 8 in self.env.hands[self.my_pos]:
+                elif natural == self.my_pos and self.state.trump is not None \
+                        and self.state.trump * 8 in self.state.hands[self.my_pos]:
                     # We were the natural recipient but hold the 7 instead:
                     # someone swapped with us. We cannot see who, so assert
                     # nothing about the face-up card rather than guess.
@@ -709,8 +731,8 @@ class StateSynchronizer:
                 else:
                     self._pin_known(natural, top_id)
             # Anchor the leader chain: the declarer leads the first trick.
-            if self._next_leader is None and self.env.declarer is not None:
-                self._next_leader = self.env.declarer
+            if self._next_leader is None and self.state.declarer is not None:
+                self._next_leader = self.state.declarer
 
         # 6b. Declared combinations ------------------------------------------
         # Sourced from the per-player `combinations` field so a dropped
@@ -732,11 +754,11 @@ class StateSynchronizer:
                            else (raw_tbl if isinstance(raw_tbl, list) else []))
             if not score_table:
                 self.match_scores = [0, 0]
-                self.env.bolts_by_team = [0, 0]        # fresh match
+                self.state.bolts_by_team = [0, 0]        # fresh match
             else:
                 scores, bolts = self._decode_score_table(score_table)
                 self.match_scores = scores
-                self.env.bolts_by_team = bolts
+                self.state.bolts_by_team = bolts
         except Exception as exc:
             if not self._score_anomaly_logged:
                 self._score_anomaly_logged = True
@@ -753,9 +775,9 @@ class StateSynchronizer:
         # NOTE (verify via auditor): assumed to be trick captures only; if the
         # site adds shown-combination points here, values can exceed the
         # training cap of 162 (out-of-distribution).
-        if self.env.phase == "PLAYING" and len(players) == 4:
+        if self.state.phase == "PLAYING" and len(players) == 4:
             pts = [_to_int(pl.get("points", 0)) for pl in players]
-            self.env.raw_points_by_team[0] = pts[0] + pts[2]
-            self.env.raw_points_by_team[1] = pts[1] + pts[3]
+            self.state.raw_points_by_team[0] = pts[0] + pts[2]
+            self.state.raw_points_by_team[1] = pts[1] + pts[3]
 
         return self.my_pos
