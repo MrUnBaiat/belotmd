@@ -28,22 +28,9 @@ import time
 import numpy as np
 
 from .game import combinations as combo
+from .game.belief import belief_matrix
 from .platform.protocol import ASCII_TO_ID, CHAR_TO_CARD, ID_TO_ASCII
 from .platform.sync import _bolt_marker, _last_cards_str, _to_int
-
-# The belief-matrix checks read the reference agent's observation encoding.
-# It is numpy-only (no torch), but it is still an *agent* concern, so a
-# missing encoder downgrades those checks instead of breaking the auditor.
-try:
-    from .agents.ppo.observation import build_observation
-except ImportError:                                   # pragma: no cover
-    build_observation = None
-
-# Local-obs layout offsets (must mirror agents/ppo/observation.py exactly):
-# hand 0:32 | faceup 32:64 | trump 64:69 | declarer 69:74 | phase 74:77 |
-# cur trick 77:185 | stats 185:191 | dealer 191:195 | last trick 195:339 |
-# BELIEF 339:435 | trick# 435:443 | mask 443:481 | graveyard 481:513
-BELIEF_SLICE = slice(339, 435)
 
 
 class FrameRecorder:
@@ -200,12 +187,12 @@ class Auditor:
                            f"ASCII map mismatch seat {i}: '{ch}' -> "
                            f"{CHAR_TO_CARD.get(ch)} but server says {dbg}")
 
-        # ---- observation-level checks at our decision points ---------
-        if (build_observation is not None and env.current_player == me
-                and phase in (6, 7, 10) and not env.done):
-            obs, gobs, mask = build_observation(env, me, sync.match_scores)
-            if np.isnan(obs).any() or np.isnan(gobs).any():
-                self._emit("VIOLATION", "NaN in observation")
+        # ---- belief and legality checks at our decision points --------
+        # These validate what the SYNCHRONIZER produced, so they are framed in
+        # terms of the state and the shared belief matrix rather than any
+        # particular agent's observation encoding.
+        if env.current_player == me and phase in (6, 7, 10) and not env.done:
+            mask = env.get_legal_actions()
             if not mask.any() and env.hands[me]:
                 # An empty mask with an EMPTY hand is legitimate: the server
                 # reports phase 10 with activePlayer still set for one more
@@ -213,7 +200,9 @@ class Auditor:
                 # was pure noise, and noise masks real signal.
                 self._emit("VIOLATION", "empty legal mask on our turn")
 
-            bel = obs[BELIEF_SLICE].reshape(3, 32)
+            bel = belief_matrix(env, me)
+            if np.isnan(bel).any():
+                self._emit("VIOLATION", "NaN in the belief matrix")
             if (bel < -1e-6).any():
                 self._emit("VIOLATION", "negative belief mass")
             for r, rel in enumerate([1, 2, 3]):
