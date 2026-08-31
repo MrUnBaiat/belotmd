@@ -1,2 +1,26 @@
-__pycache__
-node_modules
+# --- Secrets -----------------------------------------------------------
+# Session cookies live here and must never be committed.
+.env
+
+# --- Model weights -----------------------------------------------------
+# Checkpoints are distributed via GitHub Releases, not git.
+*.pt
+*.pth
+
+# --- Recorded gameplay -------------------------------------------------
+# Frame captures and session logs contain other players' usernames and
+# account IDs. They are local debugging artifacts only.
+frames*.jsonl
+*.frames.jsonl
+log*.md
+
+# --- Build / tooling ---------------------------------------------------
+__pycache__/
+*.py[cod]
+node_modules/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
