@@ -178,20 +178,40 @@ def sec_scoring(recs, base):
         if isinstance(rt, list) and len(rt) == 2:
             bs.append((rt[0].get("b"), rt[1].get("b")))
 
-    # roundTotals.b is published once per hand, alongside the row. If the
-    # capture starts mid-match we have FEWER b's than rows, and the b's we do
-    # have belong to the LAST rows -- so align from the end. Pairing from the
-    # front produced a false MISMATCH on a mid-match fragment.
-    offset = len(table) - len(bs)
+    # roundTotals.b is published once per SCORED hand. Two things break a
+    # naive pairing, and both were observed live:
+    #
+    #   * a capture that starts mid-match has FEWER b's than rows, and the
+    #     ones it has belong to the LAST rows;
+    #   * a CANCELLED deal (LESS_THAN_14 / four 7s) appends a DUPLICATE
+    #     cumulative row and publishes no new roundTotals, so a b is missing
+    #     from the MIDDLE of the table.
+    #
+    # Aligning purely from the end handles the first and corrupts the second:
+    # one cancellation shifted every row before it by one and reported 12
+    # false mismatches in an 11-row table that was entirely correct. So skip
+    # cancelled rows explicitly (a row identical to its predecessor consumes
+    # no b) and align whatever is left from the end.
+    cancelled = set()
+    for i in range(1, len(table)):
+        if table[i] == table[i - 1]:
+            cancelled.add(i)
+    scored_rows = len(table) - len(cancelled)
+    offset = scored_rows - len(bs)
     if offset < 0:
-        print(f"  (more roundTotals ({len(bs)}) than table rows "
-              f"({len(table)}) -- alignment unreliable, skipping the "
+        print(f"  (more roundTotals ({len(bs)}) than scored rows "
+              f"({scored_rows}) -- alignment unreliable, skipping the "
               f"delta cross-check)")
         bs, offset = [], len(table)
+    if cancelled:
+        print(f"  {len(cancelled)} cancelled deal(s) at row(s) "
+              f"{sorted(i + 1 for i in cancelled)} -- duplicate row, no "
+              f"roundTotals published, not cross-checked")
 
     print(f"\n  {'hand':>4}  {'row':<22} {'cumulative':>14} {'delta':>12} "
           f"{'roundTotals.b':>16}")
     scores, bolts, bad = [0, 0], [0, 0], 0
+    scored_seen = 0
     for i, row in enumerate(table):
         if not isinstance(row, list) or len(row) < 2:
             continue
@@ -210,7 +230,12 @@ def sec_scoring(recs, base):
                 except (TypeError, ValueError):
                     pass
         delta = (scores[0] - prev[0], scores[1] - prev[1])
-        j = i - offset
+        if i in cancelled:
+            print(f"  {i+1:>4}  {str(row):<22} {str(scores):>14} "
+                  f"{str(delta):>12} {'(cancelled)':>16}")
+            continue
+        j = scored_seen - offset
+        scored_seen += 1
         b = bs[j] if 0 <= j < len(bs) else (None, None)
         flag = ""
         for t in (0, 1):
@@ -218,7 +243,7 @@ def sec_scoring(recs, base):
                 flag, bad = "  <-- MISMATCH", bad + 1
         print(f"  {i+1:>4}  {str(row):<22} {str(scores):>14} {str(delta):>12} "
               f"{str(b):>16}{flag}")
-    checked = min(len(bs), len(table))
+    checked = min(len(bs), scored_rows)
     if bad:
         finding("1", f"{bad} hand(s) where the scoreTable delta disagrees with "
                      f"roundTotals.b -- the scoring model is wrong somewhere")

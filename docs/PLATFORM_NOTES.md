@@ -114,7 +114,7 @@ and an object (`81 ab ...`), leaving `{}` (0x80), `null` (0xc0) or `""` (0xa0).
 | `TRUMP_CHOOSE` | `<int 1-4>` | bare scalar |
 | `PLAY_CARD` | `"<char>"` | bare scalar |
 | `SHOW_COMBINATION` | `"<code>"` | bare scalar, e.g. `"1c"` |
-| `SWAP_SEVEN` | `{}` | **[ASSUMED]** — one of `{}` / `null` / `""` |
+| `SWAP_SEVEN` | `{}` | **[CONFIRMED]** — executed live; the server broadcast came back naming our seat |
 | `BOT_ACTIVATION` | `"deactivate"` | **must** be sent on join, or the site's own bot plays your seat |
 
 Also in the enum but unused: `CHAT_MESSAGE`, `REMOVE_PLAYER`,
@@ -262,6 +262,8 @@ corrupting the running score. Bolt markers must be parsed, not coerced.
 
 **Trap 2:** the **third bolt also costs 10 points**, and that penalty is
 invisible in `scoreTable` because the cell is a string rather than a number.
+The platform keeps counting up (`BT-1`, `BT-2`, `BT-3`, ...) rather than
+resetting the label, so the penalty is every marker where `n % 3 == 0`.
 Carrying the previous total forward therefore overstates the bolted team by 10
 until the next numeric row lands. **[CONFIRMED]**
 
@@ -384,6 +386,12 @@ declarer in a round-1 accept — holds the 7. Both are certainties.
 The window waits on a timeout rather than closing as soon as a swap happens, so
 a client has the full ~3s to decide.
 
+**The outgoing payload is `{}`, confirmed by execution.** A live swap sent
+`SWAP_SEVEN {}` and the server broadcast `{who: <our seat>, swappedCard: "E",
+topCard: "v"}` back, after which the 7 had left our hand and the face-up card
+was in it. The window closed in 1.5s rather than timing out at ~3s, which is
+itself a tell that the swap was accepted.
+
 ---
 
 ## 9. Abnormal hand endings
@@ -442,12 +450,7 @@ to block the refused action and choose differently.
 
 ## 11. Still unverified
 
-1. **`SWAP_SEVEN` outgoing payload.** Narrowed to `{}` / `null` / `""` by byte
-   count ([§3](#3-transport-and-message-protocol)); `{}` is what this client
-   sends, matching `PASS`. Swaps *by other seats* are confirmed and decode
-   correctly, so the broadcast and the `topCard` rewrite are well understood —
-   it is only the outgoing shape that remains unproven.
-2. **`trumpWasPlayed` semantics.** It resets per hand and flips mid-hand, but it
+1. **`trumpWasPlayed` semantics.** It resets per hand and flips mid-hand, but it
    does not track "the declarer has played a trump" on the timing a client needs,
    so it is safer to derive that locally.
 3. **Is `combinationsCanShow` stale across hands?** Never proven either way. It

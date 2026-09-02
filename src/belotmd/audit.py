@@ -360,8 +360,9 @@ class Auditor:
                 # cumulative row and leaves roundTotals on the previous hand,
                 # so comparing against b() here is meaningless.
                 self._emit("INFO",
-                           f"hand cancelled (LESS_THAN_14): duplicate score "
-                           f"row, totals stay ({cur[0]},{cur[1]})")
+                           f"hand cancelled (LESS_THAN_14 or four 7s): "
+                           f"duplicate score row, totals stay "
+                           f"({cur[0]},{cur[1]})")
                 self._prev_score_rows = rows
                 return
             if rt is not None:
@@ -369,8 +370,19 @@ class Auditor:
                 for t in (0, 1):
                     b = rt[t].get("b")
                     n = _bolt_marker(b)
-                    expect.append(0 if n is not None else _to_int(b))
-                    tags.append(f"BOLT#{n}" if n is not None else str(_to_int(b)))
+                    if n is None:
+                        expect.append(_to_int(b))
+                        tags.append(str(_to_int(b)))
+                        continue
+                    # A bolt row scores 0 -- EXCEPT the third, which also
+                    # costs 10 and resets the counter. _decode_score_table
+                    # applies that penalty (it is invisible in scoreTable,
+                    # whose cell is the string "BT-N"), so the expectation
+                    # has to know about it too. Without this, every third
+                    # bolt reported a MISMATCH against our own correct model.
+                    penalty = -10 if n and n % 3 == 0 else 0
+                    expect.append(penalty)
+                    tags.append(f"BOLT#{n}" + ("(-10)" if penalty else ""))
                 verdict = ("CONSISTENT" if deltas == expect else
                            "MISMATCH -- scoring model needs revisiting")
                 self._emit("PROBE",
