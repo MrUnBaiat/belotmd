@@ -339,10 +339,17 @@ class Auditor:
             st = (json.loads(raw) if isinstance(raw, str) and raw.strip()
                   else raw)
         except Exception:
-            return
+            st = None
+        # A new match clears the table, and the server sends it as the EMPTY
+        # STRING rather than "[]". Returning early there left _prev_score_rows
+        # stale at the previous match's row count, so the growth test
+        # (rows == prev + 1) failed for the first hand of every subsequent
+        # match and that hand was silently never cross-checked. An
+        # unreadable or absent table means zero rows, not "no information".
+        rows = len(st) if isinstance(st, list) else 0
         if not isinstance(st, list):
+            self._prev_score_rows = rows
             return
-        rows = len(st)
         if self._prev_score_rows is not None and rows == self._prev_score_rows + 1:
             cur, _ = sync._decode_score_table(st)
             prv, _ = sync._decode_score_table(st[:-1])
