@@ -67,7 +67,7 @@ wss.on('connection', (pySocket) => {
     pySocket.on('error', (e) => cleanup(`python socket error: ${e.message}`));
 });
 
-async function connectToGame(cookieString, say, session) {
+async function connectToGame(cookieString, say, session, avoidLast = false) {
     const headers = {
         'Cookie': cookieString,
         'User-Agent': USER_AGENT,
