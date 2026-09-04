@@ -14,13 +14,30 @@ import time
 import websockets
 
 from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
-                       LEAVE_POSITION_CHANGED, SUIT_TO_INT, TRUMP_CHOOSE_1)
+                       LEAVE_POSITION_CHANGED, PUSH_CARDS, RECOVER_LATER,
+                       RECOVER_NOW, RECOVER_SOON, RECOVER_STOP,
+                       SUIT_TO_INT, leave_recovery)
 
 
 class BelotClient:
-    def __init__(self, cookies: str, bridge_port: int = 8765):
+    def __init__(self, cookies: str, bridge_port: int = 8765,
+                 reconnect: bool = True, retry_delay_s: float = 300.0,
+                 rejoin_delay_s: float = 5.0):
+        """`reconnect` keeps the bot looking for tables instead of exiting.
+
+        Two delays, because two very different situations end a session:
+          rejoin_delay_s  a match ended or the table dissolved -- go straight
+                          back out and find another one;
+          retry_delay_s   there is nothing to join (no open tables, or we were
+                          kicked). Waiting is the only useful move, and
+                          hammering the lobby every few seconds is rude.
+        """
         self.cookies = cookies
         self.bridge_port = bridge_port
+        self.reconnect = reconnect
+        self.retry_delay_s = float(retry_delay_s)
+        self.rejoin_delay_s = float(rejoin_delay_s)
+        self.sessions_played = 0
         self.ws = None
         self.node_process = None
         self.my_player_id = None
@@ -28,6 +45,7 @@ class BelotClient:
         self._queue = None
         self._consumer = None
         self._match_started = False
+        self._in_room = False
 
     # How long to wait for `node bridge.js` to bind BRIDGE_PORT.
     DAEMON_TIMEOUT_S = 15.0
@@ -86,7 +104,7 @@ class BelotClient:
         async with await self._await_daemon(uri) as ws:
             self.ws = ws
             print("[SDK] Connected to bridge daemon. Releasing join request...")
-            await ws.send(json.dumps({"action": "CONNECT", "cookies": self.cookies}))
+            await self._request_table(ws)
 
             self._queue = asyncio.Queue()
             consumer = asyncio.create_task(
@@ -100,6 +118,9 @@ class BelotClient:
                 if event == "CONNECTED":
                     self.room_id = msg.get("roomId")
                     self.my_player_id = msg.get("playerId")
+                    self._in_room = True
+                    self._match_started = False
+                    self.sessions_played += 1
                     print(f"[SDK] Joined Game Room: {self.room_id} | Player ID: {self.my_player_id}")
                     await self.deactivate_bot()
 
@@ -112,7 +133,11 @@ class BelotClient:
                     # legal mask and silently dropping our turn.
                     # It also leaked the task -- asyncio only keeps a weak
                     # reference, so an un-stored task can be GC'd mid-flight.
-                    if (msg.get("data") or {}).get("currentPhase", 0) >= TRUMP_CHOOSE_1:
+                    # The match is underway from the deck cut (phase 2),
+                    # not from the first bid. Sticky for the room session:
+                    # a cancelled deal drops back through phases 1-2 without
+                    # meaning we returned to the lobby.
+                    if (msg.get("data") or {}).get("currentPhase", 0) >= PUSH_CARDS:
                         self._match_started = True
                     await self._queue.put(("STATE", msg["data"]))
 
@@ -122,31 +147,79 @@ class BelotClient:
                                                        msg.get("data"))))
 
                 elif event == "ERROR":
-                    print(f"[SDK Error]: {msg.get('message') or msg.get('code')}")
+                    detail = msg.get("message") or msg.get("code")
+                    print(f"[SDK Error]: {detail}")
+                    # An error while we are NOT in a room means the join
+                    # itself failed -- almost always "No public open tables
+                    # available." Without this the bot sat idle forever
+                    # waiting for frames from a room it never entered.
+                    if not self._in_room:
+                        if not await self._recover(ws, RECOVER_LATER,
+                                                   f"could not join a table ({detail})"):
+                            break
 
                 elif event == "LEAVE":
                     code = msg.get("code")
                     label = LEAVE_NAMES.get(code, "UNKNOWN")
-                    if code == LEAVE_POSITION_CHANGED and not self._match_started:
-                        print(f"[SDK] {label} ({code}) in the lobby: "
-                              f"rejoining...")
-                        await ws.send(json.dumps({"action": "CONNECT",
-                                                  "cookies": self.cookies}))
-                        continue
-                    if code == LEAVE_POSITION_CHANGED:
-                        # Cheap assertion on the platform invariant. If this
-                        # ever fires, seats moved mid-match and every
-                        # seat-indexed belief (known_cards, impossible_cards,
-                        # hands, team parity) now describes the wrong player --
-                        # stopping is correct, reconnecting would not be.
-                        print(f"[SDK][WARN] {label} ({code}) AFTER play began "
-                              f"-- not supposed to happen; stopping rather "
-                              f"than resuming on stale seat state.")
-                    print(f"[SDK] Left room session: {label} ({code}).")
-                    break
+                    self._in_room = False
+                    action = leave_recovery(code)
+
+                    if label == "UNKNOWN":
+                        print(f"[SDK][WARN] unrecognised close code {code}; "
+                              f"treating it as recoverable.")
+                    if code == LEAVE_POSITION_CHANGED and self._match_started:
+                        # A cheap assertion on a platform invariant: the host
+                        # can only rotate seats BETWEEN joining a table and the
+                        # match starting. Once it is under way this cannot
+                        # happen, so if it ever does, something about the
+                        # platform is not what we think it is -- say so
+                        # unmistakably. We still resync rather than end an
+                        # unattended run, and the synchronizer will flag the
+                        # hand as degraded.
+                        print("=" * 72)
+                        print(f"[SDK][VIOLATION] {label} ({code}) AFTER the "
+                              f"match began. This is not supposed to be "
+                              f"possible.")
+                        print("                 Seat indices have moved, so "
+                              "every seat-indexed belief is now wrong.")
+                        print("                 Resyncing, but keep the "
+                              "recording -- this is worth understanding.")
+                        print("=" * 72)
+
+                    if not await self._recover(ws, action,
+                                               f"{label} ({code})"):
+                        break
 
             await self._queue.put((None, None))     # drain sentinel
             await consumer
+
+    async def _request_table(self, ws):
+        """Ask the bridge to find a table and join it."""
+        self._in_room = False
+        self._match_started = False
+        await ws.send(json.dumps({"action": "CONNECT",
+                                  "cookies": self.cookies}))
+
+    async def _recover(self, ws, action, reason):
+        """Act on a recovery decision. -> True to keep the session alive."""
+        if action == RECOVER_STOP:
+            print(f"[SDK] Session ended: {reason}. Not rejoining.")
+            return False
+        if not self.reconnect:
+            print(f"[SDK] {reason}; --once was requested, so stopping.")
+            return False
+
+        delay = {RECOVER_NOW: 0.0,
+                 RECOVER_SOON: self.rejoin_delay_s,
+                 RECOVER_LATER: self.retry_delay_s}[action]
+        if delay:
+            print(f"[SDK] {reason}; looking for another table in "
+                  f"{delay:.0f}s. ({self.sessions_played} played so far)")
+            await asyncio.sleep(delay)
+        else:
+            print(f"[SDK] {reason}; rejoining now.")
+        await self._request_table(ws)
+        return True
 
     async def _consume(self, on_state_callback, on_message_callback):
         """Single consumer: exactly one handler touches the synchronizer at a

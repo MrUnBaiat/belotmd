@@ -82,6 +82,17 @@ class Config:
     agent: str = "random"
     checkpoint: str = ""
 
+    # --- staying on a table ---
+    # Keep looking for tables instead of exiting after one session. A match
+    # ending dissolves the table (TABLE_REMOVED), so without this the bot
+    # plays one table's worth of matches and stops.
+    reconnect: bool = True
+    # Nothing to join right now: no open tables, or we were kicked. Waiting is
+    # the only useful move, and hammering the lobby every few seconds is rude.
+    retry_delay_s: float = 300.0
+    # A match ended or the table dissolved -- go straight back out.
+    rejoin_delay_s: float = 5.0
+
     # --- timing ---
     # If the state has not advanced this long after we dispatched an action,
     # assume the server refused it and re-dispatch. A successful action always
@@ -105,6 +116,9 @@ class Config:
             auto_swap_seven=_flag("BELOT_AUTO_SWAP_SEVEN", True),
             agent=os.environ.get("BELOT_AGENT", "random"),
             checkpoint=os.environ.get("BELOT_CHECKPOINT", ""),
+            reconnect=_flag("BELOT_RECONNECT", True),
+            retry_delay_s=float(os.environ.get("BELOT_RETRY_DELAY", 300)),
+            rejoin_delay_s=float(os.environ.get("BELOT_REJOIN_DELAY", 5)),
         )
         for key, value in overrides.items():
             if value is not None:

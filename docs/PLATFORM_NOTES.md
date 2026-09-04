@@ -135,10 +135,29 @@ Also in the enum but unused: `CHAT_MESSAGE`, `REMOVE_PLAYER`,
 `4001` OTHER_SESSION · `4002` KICKED · `4003` TABLE_REMOVED · `4004` I_LEFT ·
 `4005` POSITION_CHANGED.
 
-`4003` at the end of a match is normal. `4005` occurs only in the lobby, while
-the server is still gathering players and seats shuffle; once a match is under
-way it cannot happen, so a plain rejoin is a safe response to it there and a
-danger sign anywhere else.
+Meanings, from the platform's own enum plus what each looks like live:
+
+| Code | What happened | Recoverable |
+|---|---|---|
+| `4001` OTHER_SESSION | the account opened the table somewhere else | **no** — rejoining kicks the other session, which kicks back, forever |
+| `4002` KICKED | the host removed us from the table | yes, but wait: the table is still there and we are not welcome |
+| `4003` TABLE_REMOVED | the table dissolved — **the normal end of every match**, and also what a host deleting a table before it starts looks like | yes, go and find another |
+| `4004` I_LEFT | we asked to leave | no |
+| `4005` POSITION_CHANGED | the host rotated players around the table to set up teams. **Nobody is removed** — only seat indices move. Happens **only between joining a table and the match starting** | yes, and rejoining is *necessary*: every seat-indexed belief now describes a different player |
+
+`4003` is by far the most common in a long run, and it is not a failure. A
+client that treats it as one plays a single table and stops.
+
+`4005` is bounded: once a match is under way — from the deck cut onward, not
+from the first bid — the host can no longer rotate seats, so it cannot occur.
+That makes it a useful assertion. A `4005` after the cut would mean seat
+indices moved underneath every belief we hold, and that the platform does not
+behave the way this document claims. **[CONFIRMED by the platform's own
+behaviour]**
+
+Separately, a join can fail before any room exists — an empty lobby answers
+with no open table at all. That is not a close code and arrives on a different
+path, but it needs the same treatment: wait, then look again.
 
 ---
 

@@ -80,6 +80,11 @@ belot-bot --list-agents
 belot-bot --agent random        # ships with the SDK; plays legal, plays badly
 ```
 
+It keeps playing on its own. A match ending dissolves the table, so the bot
+goes back to the lobby and finds another; an empty lobby or a kick means
+waiting five minutes and looking again. `--once` plays a single table and
+exits; `--retry-delay` and `--rejoin-delay` tune the two waits.
+
 ## Architecture
 
 ```

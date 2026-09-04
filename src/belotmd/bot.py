@@ -36,7 +36,12 @@ class LiveBelotBot:
 
     def __init__(self, config: Config = None, agent=None, agent_kwargs=None):
         self.config = config or Config.from_env()
-        self.client = BelotClient(cookies=self.config.require_cookies())
+        self.client = BelotClient(
+            cookies=self.config.require_cookies(),
+            reconnect=self.config.reconnect,
+            retry_delay_s=self.config.retry_delay_s,
+            rejoin_delay_s=self.config.rejoin_delay_s,
+        )
         self.sync_engine = StateSynchronizer()
 
         # The decision-maker. Anything satisfying belotmd.agents.base.Agent

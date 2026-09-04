@@ -52,6 +52,19 @@ def build_parser():
     audit.add_argument("--no-audit", dest="audit", action="store_false",
                        help="run without recording or auditing")
 
+    p.add_argument("--once", dest="reconnect", action="store_false",
+                   default=None,
+                   help="play one table and exit, instead of looking for "
+                        "another when the table dissolves")
+    p.add_argument("--retry-delay", dest="retry_delay_s", type=float,
+                   default=None, metavar="SECONDS",
+                   help="wait this long when there is nothing to join -- no "
+                        "open tables, or we were kicked (default 300)")
+    p.add_argument("--rejoin-delay", dest="rejoin_delay_s", type=float,
+                   default=None, metavar="SECONDS",
+                   help="wait this long after a match ends before finding "
+                        "another table (default 5)")
+
     p.add_argument("--list-agents", action="store_true",
                    help="print the agents this environment can build, and exit")
     return p
@@ -77,6 +90,9 @@ def main(argv=None):
         agent=args.agent,
         frames_path=args.frames_path,
         audit=args.audit,
+        reconnect=args.reconnect,
+        retry_delay_s=args.retry_delay_s,
+        rejoin_delay_s=args.rejoin_delay_s,
     )
     cfg.require_cookies()
 

@@ -71,10 +71,50 @@ LEAVE_NAMES = {
     LEAVE_TABLE_REMOVED: "TABLE_REMOVED", LEAVE_I_LEFT: "I_LEFT",
     LEAVE_POSITION_CHANGED: "POSITION_CHANGED",
 }
-# 4005 is the only recoverable code, and it can only occur in the LOBBY while
-# the server is still gathering players and seats shuffle. Once a match is
-# under way it cannot happen, so there is never accumulated hand state to
-# invalidate -- a plain rejoin is enough.
+
+
+# ------------------------------------------------------ recovery policy
+# What to do when a room closes. Most of these are ordinary events in a long
+# session, not failures: a table dissolving at the end of a match is how every
+# match ends.
+
+RECOVER_STOP = "stop"     # do not rejoin; end the session
+RECOVER_NOW = "now"       # rejoin immediately, nothing was lost
+RECOVER_SOON = "soon"     # short pause, then look for a table
+RECOVER_LATER = "later"   # long pause: there is nothing to join right now
+
+LEAVE_RECOVERY = {
+    # Our account opened the table somewhere else. Rejoining would kick that
+    # session, which would kick us back, forever. Stop and say so.
+    LEAVE_OTHER_SESSION: RECOVER_STOP,
+
+    # Removed from the table by the host. The table is still there and we are
+    # not welcome at it, so wait before looking again rather than immediately
+    # re-reserving the same seat.
+    LEAVE_KICKED: RECOVER_LATER,
+
+    # The table dissolved. This is the NORMAL end of every match, and also
+    # what happens when a host deletes a table before it starts. Either way
+    # the right move is to go and find another one.
+    LEAVE_TABLE_REMOVED: RECOVER_SOON,
+
+    # We asked to leave.
+    LEAVE_I_LEFT: RECOVER_STOP,
+
+    # The host rotated players around the table to set up teams. Nobody was
+    # removed -- only seat indices changed -- so rejoining is both safe and
+    # necessary: every seat-indexed belief now describes a different player.
+    LEAVE_POSITION_CHANGED: RECOVER_NOW,
+}
+
+# An unrecognised code keeps the bot alive rather than ending an overnight
+# run, but on the long delay and with a warning.
+DEFAULT_RECOVERY = RECOVER_LATER
+
+
+def leave_recovery(code):
+    """-> one of the RECOVER_* constants for a room close code."""
+    return LEAVE_RECOVERY.get(code, DEFAULT_RECOVERY)
 
 
 # ------------------------------------------------------------ action space
