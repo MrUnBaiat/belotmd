@@ -117,34 +117,61 @@ register("highest")(lambda **kw: HighestLegal())
 ### Search (ISMCTS / determinization)
 
 You cannot search the real game, because you do not know the other hands. You
-sample consistent worlds instead:
+sample consistent worlds instead.
+
+**Read the constraints from `constraints()`, never off `state.hands`.** An
+opponent's `hands` entry holds placeholder ids of the right length — live it
+can read `[0, 1, 2, 3, 4, 5]`, which looks exactly like the 7 through Q of
+diamonds and is not:
 
 ```python
-def determinize(self, state, seat, rng):
-    """One plausible full deal, consistent with everything known."""
-    pool = [c for c in unseen_cards(state, seat)
-            if not state.known_cards[:, c].any()]
-    rng.shuffle(pool)
+from belotmd import constraints
 
-    hands = {seat: list(state.hands[seat])}
-    for p in [(seat + i) % 4 for i in (1, 2, 3)]:
-        hand = list(np.flatnonzero(state.known_cards[p]))   # certainties first
-        need = len(state.hands[p]) - len(hand)
-        # then fill from the pool, skipping cards p provably cannot hold
-        take = [c for c in pool if not state.impossible_cards[p, c]][:need]
-        for c in take:
-            pool.remove(c)
-        hands[p] = hand + take
-    return hands
+c = constraints(state, seat)
+c.own_hand          # your real cards
+c.hand_sizes        # (n0, n1, n2, n3) -- authoritative
+c.pool              # unplaced cards, location unknown
+c.pins[p]           # cards seat p provably HOLDS
+c.voids[p]          # cards seat p provably CANNOT hold
+c.played            # graveyard + table
+c.degraded          # joined mid-hand: constraints are INCOMPLETE
+c.need(p)           # how many pool cards p still takes
+c.candidates(card)  # which seats could hold it
 ```
 
-Sample *N* worlds, search each with your favourite algorithm, aggregate the
-root statistics, return the best action. `belief_matrix` is a reasonable
-importance-sampling weight if uniform determinization is too crude.
+That is the complete input to any sampler. Bring your own, or use the one here:
 
-Note the constraint satisfaction is not guaranteed to succeed on a naive greedy
-fill — with tight void constraints you may need to retry or use a matching
-algorithm. Budget for that.
+```python
+from belotmd import sample_determinization, Infeasible
+
+hands = sample_determinization(state, seat, rng)   # four card lists, by seat
+```
+
+It places the most-constrained card first, because a naive shuffle-and-fill
+dead-ends surprisingly often once voids accumulate — and a dead-end quietly
+patched yields an *illegal* world, which is worse than no world at all.
+Genuinely contradictory constraints raise `Infeasible` rather than being
+guessed past.
+
+**Using your own sampler is expected**, especially if you want a particular
+distribution — importance-weighted by `belief_matrix`, say. Hold it to the
+same standard with the validator:
+
+```python
+c.check(my_hands)        # raises Infeasible naming the violated constraint
+```
+
+**Mind the clock.** `state.deadline` is a `time.monotonic()` stamp by which the
+action must be on the wire; `state.time_left_s` is the same as a duration. A
+card gets 25s, a bid 12s, the seven-swap window 3s. Overrunning loses the
+*seat*, not just the turn, so budget explicitly:
+
+```python
+import time
+
+while time.monotonic() < state.deadline - self.safety_margin:
+    self.one_more_world()
+```
 
 ### Learned
 

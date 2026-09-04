@@ -11,6 +11,8 @@ Field-by-field trust rules are documented in docs/PLATFORM_NOTES.md.
 
 import json
 import re
+import time
+
 import numpy as np
 
 from ..game import combinations as combo
@@ -50,6 +52,19 @@ def _to_int(v, default=0):
         m = re.search(r"-?\d+", v)
         return int(m.group()) if m else default
     return default
+
+
+# The server publishes both clocks in DECISECONDS. Measured live: 250 units
+# elapsed over 25s of wall clock, and the seven-swap window (totalTime 30)
+# closed after the 2.9-3.0s the bot logged.
+DECISECOND = 0.1
+
+
+def _deciseconds(v):
+    """A raw clock field -> seconds, or None when absent/unusable."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return max(0.0, float(v) * DECISECOND)
 
 
 def _last_cards_str(raw_state) -> str:
@@ -460,6 +475,28 @@ class StateSynchronizer:
         # 3. Direct mappings -----------------------------------------------
         self.state.dealer = raw_state.get("dealer", 0)
         self.state.current_player = raw_state.get("activePlayer", 0)
+
+        # Turn clock. LIVE-CONFIRMED: `timeleft` and `totalTime` are in
+        # DECISECONDS (measured 1 unit = 0.107s over several countdowns), and
+        # the budget depends on the phase: 250 to play a card, 120 to bid, 30
+        # for the seven-swap window, 50 for the cut.
+        #
+        # This matters to any agent that thinks for a variable amount of time.
+        # Overrunning does not merely lose the turn: belot.md hands the seat to
+        # its own bot FOR THE REST OF THE SESSION. `deadline` is a
+        # time.monotonic() stamp so a search can budget against it directly.
+        # Joined mid-hand: earlier tricks were never observed, so the belief
+        # state is INCOMPLETE rather than merely uncertain. A search should
+        # know, because a determinization drawn from incomplete constraints
+        # can contain cards that were actually played.
+        self.state.beliefs_degraded = self.degraded_hand
+
+        self.state.time_left_s = _deciseconds(raw_state.get("timeleft"))
+        self.state.turn_budget_s = _deciseconds(raw_state.get("totalTime"))
+        self.state.deadline = (
+            time.monotonic() + self.state.time_left_s
+            if self.state.time_left_s is not None else None
+        )
 
         # LIVE-OBSERVED: `trump` and `declarer` carry the PREVIOUS hand's
         # values right through the deal and bidding, only updating when a bid

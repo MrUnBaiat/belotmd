@@ -176,6 +176,31 @@ One frame, trimmed to the fields that matter:
 - `cardPlayed` / `cardOrder` are **absent** for players who have not yet acted;
   `cardOrder` is 1-based within the trick.
 
+### 4.2 The turn clock **[CONFIRMED]**
+
+`timeleft` and `totalTime` are in **deciseconds**. Measured against wall clock
+across several countdowns one unit is 0.107s, and the seven-swap window
+(`totalTime` 30) closed after the 2.9-3.0s a client logged.
+
+The budget depends on the phase:
+
+| Phase | `totalTime` | Seconds |
+|---|---|---|
+| 2 cut, 5 deal | 50 | 5.0 |
+| 6 / 7 bidding | 120 | 12.0 |
+| 8 seven-swap | 30 | 3.0 |
+| 10 **play a card** | 250 | **25.0** |
+
+`timeleft` is the remaining budget for **the seat that must act**, not for you
+specifically. It is republished on every frame and counts down.
+
+This matters to any client that thinks for a variable amount of time.
+Overrunning does not merely forfeit the turn: belot.md hands the seat to its own
+bot **for the rest of the session** ([§10](#10-timeouts-and-the-platform-bot)).
+Budget against the clock and leave margin for the round trip.
+
+---
+
 ### 4.1 Field trust table
 
 The server leaves many fields carrying the **previous hand's value** until the

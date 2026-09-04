@@ -76,6 +76,22 @@ class BelotState:
 
         self.done = False
 
+        # Turn clock, filled in from live frames by the synchronizer (see
+        # belotmd.platform.sync). None offline, where there is no clock.
+        #   time_left_s    seconds remaining for the seat that must act
+        #   turn_budget_s  seconds that seat was given in total
+        #   deadline       time.monotonic() stamp to act by
+        # An agent that searches should budget against `deadline`: overrunning
+        # loses the seat to the platform bot permanently, not just the turn.
+        # True when we joined a hand already in progress: past tricks are
+        # unrecoverable, so the belief state is incomplete. Set by the
+        # synchronizer; always False offline.
+        self.beliefs_degraded = False
+
+        self.time_left_s = None
+        self.turn_budget_s = None
+        self.deadline = None
+
         # Forced-trump exception ("BIZON"): a face-up Jack settles trump with
         # no bidding at all, and the player left of the dealer becomes
         # declarer. Live, this is why some hands jump phase 5 -> 9 and skip
