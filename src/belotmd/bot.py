@@ -34,6 +34,10 @@ from .platform.sync import StateSynchronizer
 class LiveBelotBot:
     """Plays one belot.md session with the supplied agent."""
 
+    # Shortest gap between two READY sends while the server has not yet
+    # acknowledged the first.
+    READY_RESEND_S = 1.0
+
     def __init__(self, config: Config = None, agent=None, agent_kwargs=None):
         self.config = config or Config.from_env()
         self.client = BelotClient(
@@ -55,16 +59,36 @@ class LiveBelotBot:
         self.agent = agent
         print(f"[Bot] Agent: {getattr(self.agent, 'name', type(self.agent).__name__)}")
 
-        # Turn debounce (replaces the old hard dedup, which deadlocked the
-        # bot forever if the server ever rejected an action)
+        self._room_seq = 0
+        self._reset_room_state()
+
+        self.audit = self.config.audit
+        if self.audit:
+            self.recorder = FrameRecorder(self.config.frames_path)
+            self.auditor = Auditor(verbose=True)
+            print(f"[Bot] AUDIT mode on: recording frames to "
+                  f"{self.config.frames_path}")
+
+    def _reset_room_state(self):
+        """Everything that describes THE TABLE WE ARE AT, in one place.
+
+        A long run moves between tables, and every one of these is meaningless
+        at the next: a play in flight, a declaration already announced, a
+        seven-swap window, whose turn we thought it was. Carrying any of them
+        across a rejoin is the bug class that made the bot sit silently in a
+        lobby -- so they are reset together, from a single place, rather than
+        each being someone's job to remember.
+        """
+        # Turn debounce (replaces an older hard dedup, which deadlocked the
+        # bot forever if the server ever rejected an action).
         self.last_action_turn_id = None
         self.last_dispatch_ts = 0.0
         # (turn_id, agent_snapshot_before_this_turn, {actions already refused})
         # Keeps agent state advancing once per DECISION rather than once per
         # DISPATCH, and blocks a refused action on re-dispatch.
         self._turn_decision = None
-        self._ready_sent_phase = None
-        self._declared = set()          # (hand_id, value) already announced
+        self._ready_sent_ts = 0.0     # last READY, for the resend debounce
+        self._declared = set()        # (hand_id, value) already announced
         self._pending_play = None     # (hand_id, trick_no, card) in flight
         self._rejected_plays = 0
         self.seat_bot_controlled = False
@@ -73,12 +97,16 @@ class LiveBelotBot:
         self._swap_sent = False       # SWAP_SEVEN sent in that window
         self._swap_skip = False       # decided not to swap this window
 
-        self.audit = self.config.audit
-        if self.audit:
-            self.recorder = FrameRecorder(self.config.frames_path)
-            self.auditor = Auditor(verbose=True)
-            print(f"[Bot] AUDIT mode on: recording frames to "
-                  f"{self.config.frames_path}")
+    def _check_room_change(self):
+        """Notice that the client joined a different table and start clean."""
+        seq = getattr(self.client, "sessions_played", 0)
+        if seq != self._room_seq:
+            if self._room_seq:
+                print(f"[Bot] New table (session {seq}); clearing per-table "
+                      f"state.")
+            self._room_seq = seq
+            self._reset_room_state()
+            self.agent.reset()
 
     async def on_state_update(self, raw_state: dict, my_player_id: str):
         try:
@@ -92,6 +120,7 @@ class LiveBelotBot:
             traceback.print_exc()
 
     async def _on_state_update(self, raw_state: dict, my_player_id: str):
+        self._check_room_change()
         my_pos = self.sync_engine.sync(raw_state, my_player_id)
         if my_pos is None:
             return
@@ -134,14 +163,24 @@ class LiveBelotBot:
             elif phase >= DEAL_CARDS_2:
                 self._resolve_swap_attempt(my_pos)
 
-        # 1. Auto-Ready on game transitions (deduped by phase transition)
+        # 1. Auto-Ready on game transitions.
+        #
+        # Driven by the server's own answer, not by remembering what we sent.
+        # `players[me].ready` is in every frame and is the only thing that
+        # actually decides whether the table can start, so asking it is both
+        # idempotent and self-correcting: a lost READY is retried, and a READY
+        # that landed is never repeated.
+        #
+        # The previous version deduped on the phase alone and kept the flag
+        # across rooms. Every table begins at phase 0, so after the first one
+        # the dedup suppressed exactly the READY the next table was waiting
+        # for -- silently, since nothing rejected anything. We simply never
+        # sent it, and sat in the lobby forever.
         if phase == NOT_STARTED or phase in END_PHASES:
             self.agent.reset()
-            if self._ready_sent_phase != phase:
-                self._ready_sent_phase = phase
-                await self.client.send_ready(True)
+            if not self._server_says_ready(raw_state, my_pos):
+                await self._send_ready_debounced()
             return
-        self._ready_sent_phase = None
 
         # 2. Cut deck phase
         if phase == 2 and active_player == my_pos:
@@ -187,6 +226,25 @@ class LiveBelotBot:
             self.last_dispatch_ts = now
 
             await self._select_and_execute_action(my_pos, turn_id)
+
+    @staticmethod
+    def _server_says_ready(raw_state, my_pos):
+        players = raw_state.get("players", [])
+        if my_pos >= len(players):
+            return False
+        return bool(players[my_pos].get("ready"))
+
+    async def _send_ready_debounced(self):
+        """Announce readiness, at most once a second.
+
+        The server needs a frame or two to reflect it, and several arrive in
+        that window. Retrying is correct -- flooding is not.
+        """
+        now = time.monotonic()
+        if now - self._ready_sent_ts < self.READY_RESEND_S:
+            return
+        self._ready_sent_ts = now
+        await self.client.send_ready(True)
 
     async def _check_play_accepted(self, my_pos):
         """Did the server actually take the card we sent?
