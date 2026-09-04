@@ -88,10 +88,13 @@ LEAVE_RECOVERY = {
     # session, which would kick us back, forever. Stop and say so.
     LEAVE_OTHER_SESSION: RECOVER_STOP,
 
-    # Removed from the table by the host. The table is still there and we are
-    # not welcome at it, so wait before looking again rather than immediately
-    # re-reserving the same seat.
-    LEAVE_KICKED: RECOVER_LATER,
+    # Removed from the table by the host. The lobby pick takes the FIRST open
+    # table, and the one that just ejected us has a free seat again -- so
+    # without care we walk straight back in and get kicked again. The bridge
+    # is told to skip it (`avoidLast`), which makes a short pause safe: if it
+    # was the only table on offer, that surfaces as "nothing available" and
+    # falls into the long wait instead.
+    LEAVE_KICKED: RECOVER_SOON,
 
     # The table dissolved. This is the NORMAL end of every match, and also
     # what happens when a host deletes a table before it starts. Either way

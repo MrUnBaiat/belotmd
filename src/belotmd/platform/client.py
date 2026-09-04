@@ -14,7 +14,8 @@ import time
 import websockets
 
 from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
-                       LEAVE_POSITION_CHANGED, PUSH_CARDS, RECOVER_LATER,
+                       LEAVE_KICKED, LEAVE_POSITION_CHANGED, PUSH_CARDS,
+                       RECOVER_LATER,
                        RECOVER_NOW, RECOVER_SOON, RECOVER_STOP,
                        SUIT_TO_INT, leave_recovery)
 
@@ -186,21 +187,28 @@ class BelotClient:
                               "recording -- this is worth understanding.")
                         print("=" * 72)
 
-                    if not await self._recover(ws, action,
-                                               f"{label} ({code})"):
+                    if not await self._recover(
+                            ws, action, f"{label} ({code})",
+                            avoid_last=(code == LEAVE_KICKED)):
                         break
 
             await self._queue.put((None, None))     # drain sentinel
             await consumer
 
-    async def _request_table(self, ws):
-        """Ask the bridge to find a table and join it."""
+    async def _request_table(self, ws, avoid_last=False):
+        """Ask the bridge to find a table and join it.
+
+        `avoid_last` tells it to skip the table it most recently reserved --
+        the one that just removed us. Without that the lobby pick, which takes
+        the first open table, would very likely hand us straight back to it.
+        """
         self._in_room = False
         self._match_started = False
         await ws.send(json.dumps({"action": "CONNECT",
-                                  "cookies": self.cookies}))
+                                  "cookies": self.cookies,
+                                  "avoidLast": bool(avoid_last)}))
 
-    async def _recover(self, ws, action, reason):
+    async def _recover(self, ws, action, reason, avoid_last=False):
         """Act on a recovery decision. -> True to keep the session alive."""
         if action == RECOVER_STOP:
             print(f"[SDK] Session ended: {reason}. Not rejoining.")
@@ -218,7 +226,7 @@ class BelotClient:
             await asyncio.sleep(delay)
         else:
             print(f"[SDK] {reason}; rejoining now.")
-        await self._request_table(ws)
+        await self._request_table(ws, avoid_last=avoid_last)
         return True
 
     async def _consume(self, on_state_callback, on_message_callback):

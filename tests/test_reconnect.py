@@ -33,8 +33,8 @@ from belotmd.platform.protocol import (LEAVE_I_LEFT, LEAVE_KICKED,
 @pytest.mark.parametrize("code,expected,why", [
     (LEAVE_OTHER_SESSION, RECOVER_STOP,
      "rejoining would kick the other session, which kicks us back, forever"),
-    (LEAVE_KICKED, RECOVER_LATER,
-     "the table is still there and we are not welcome; wait before looking"),
+    (LEAVE_KICKED, RECOVER_SOON,
+     "safe to look again quickly because the bridge now skips that table"),
     (LEAVE_TABLE_REMOVED, RECOVER_SOON,
      "the normal end of every match -- go find another table"),
     (LEAVE_I_LEFT, RECOVER_STOP,
@@ -121,15 +121,31 @@ def test_no_open_tables_retries_instead_of_sitting_idle():
     assert slept == [300], "should have waited the long delay first"
 
 
-def test_being_kicked_waits_before_looking_again():
-    script = [
+def test_being_kicked_looks_elsewhere_rather_than_walking_back_in():
+    """The lobby pick takes the FIRST open table, and the one that ejected us
+    has a free seat again -- so it is a prime candidate to be handed straight
+    back. The bridge is told to skip it, which is what makes a short pause
+    safe rather than a kick loop five times faster."""
+    ws, slept, _ = _run_connect([
         {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
         {"event": "LEAVE", "code": LEAVE_KICKED},
         {"event": "CONNECTED", "roomId": "r2", "playerId": "p"},
-    ]
-    bridge, slept = asyncio.run(_drive(script, retry_delay_s=300))
-    assert bridge.joins == 2
-    assert slept == [300]
+    ], rejoin_delay_s=5)
+    assert ws.joins == 2
+    assert slept == [5], "short pause, not the five-minute one"
+    rejoin = [m for m in ws.sent if m.get("action") == "CONNECT"][-1]
+    assert rejoin["avoidLast"] is True, "must not be offered that table again"
+
+
+def test_only_a_kick_asks_the_bridge_to_skip_a_table():
+    """A table dissolving at the end of a match is not a reason to avoid it."""
+    ws, _, _ = _run_connect([
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+        {"event": "LEAVE", "code": LEAVE_TABLE_REMOVED},
+        {"event": "CONNECTED", "roomId": "r2", "playerId": "p"},
+    ])
+    rejoin = [m for m in ws.sent if m.get("action") == "CONNECT"][-1]
+    assert rejoin["avoidLast"] is False
 
 
 def test_a_table_dissolving_goes_straight_back_out():

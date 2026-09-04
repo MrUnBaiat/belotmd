@@ -140,7 +140,7 @@ Meanings, from the platform's own enum plus what each looks like live:
 | Code | What happened | Recoverable |
 |---|---|---|
 | `4001` OTHER_SESSION | the account opened the table somewhere else | **no** — rejoining kicks the other session, which kicks back, forever |
-| `4002` KICKED | the host removed us from the table | yes, but wait: the table is still there and we are not welcome |
+| `4002` KICKED | the host removed us from the table | yes — but the seat we vacated makes that table look *open* again, so a client that just re-queries the lobby is liable to walk straight back in. Skip it explicitly |
 | `4003` TABLE_REMOVED | the table dissolved — **the normal end of every match**, and also what a host deleting a table before it starts looks like | yes, go and find another |
 | `4004` I_LEFT | we asked to leave | no |
 | `4005` POSITION_CHANGED | the host rotated players around the table to set up teams. **Nobody is removed** — only seat indices move. Happens **only between joining a table and the match starting** | yes, and rejoining is *necessary*: every seat-indexed belief now describes a different player |

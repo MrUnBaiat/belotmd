@@ -13,7 +13,12 @@ console.log(`[Bridge] Daemon listening on ws://127.0.0.1:${BRIDGE_PORT}`);
 wss.on('connection', (pySocket) => {
     console.log("[Bridge] Python Agent connected.");
 
-    const session = { room: null, ping: null, closed: false };
+    // `lastTableId` lets Python say "anywhere but there" after a kick:
+    // the lobby pick below takes the FIRST open table, and the table that
+    // just ejected us has a free seat again, so it is a prime candidate to
+    // be chosen straight back.
+    const session = { room: null, ping: null, closed: false,
+                      lastTableId: null };
 
     // AUDIT: every send was unguarded. onStateChange/onMessage/onError fire
     // from Colyseus internals, so a throw became an unhandled rejection while
@@ -38,7 +43,8 @@ wss.on('connection', (pySocket) => {
                     console.warn("[Bridge] CONNECT while a session is open — tearing the old one down first.");
                     dropRoom();
                 }
-                await connectToGame(cmd.cookies, say, session);
+                await connectToGame(cmd.cookies, say, session,
+                                    cmd.avoidLast === true);
             } else if (cmd.action === "SEND") {
                 if (!session.room) { say({ event: "ERROR", message: "SEND with no active room" }); return; }
                 session.room.send(cmd.type, cmd.payload);
@@ -96,9 +102,19 @@ async function connectToGame(cookieString, say, session) {
             const lobbyRes = await fetch("https://belot.md/gameTables.php", { method: "POST", headers, body: lobbyParams });
             const lobbyData = await lobbyRes.json();
             
-            const openTable = lobbyData.mese?.find(t => t.full === 0 && t.pass === false && t.minStatus === undefined); // && t.creator.includes("UnBaiat1") 
+            const avoid = avoidLast ? session.lastTableId : null;
+            const isOpen = (t) => t.full === 0 && t.pass === false && t.minStatus === undefined;
+            let openTable = lobbyData.mese?.find(t => isOpen(t) && String(t.id) !== String(avoid));
+            if (!openTable && avoid) {
+                // The only thing on offer is the table we were just thrown
+                // out of. Report it as nothing available rather than walking
+                // back in to be kicked again; Python will wait and re-ask.
+                console.log(`[Bridge] Only table ${avoid} is open, and we were just removed from it.`);
+                throw new Error("No public open tables available.");
+            }
             if (!openTable) throw new Error("No public open tables available.");
 
+            session.lastTableId = openTable.id;
             console.log(`[Bridge] Reserving seat at table ${openTable.id}...`);
             const joinParams = new URLSearchParams({ enterGame: "4", gameId: openTable.id, password: "" });
             const joinRes = await fetch("https://belot.md/gameTables.php", { method: "POST", headers, body: joinParams });
