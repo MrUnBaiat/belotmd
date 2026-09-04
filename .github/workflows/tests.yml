@@ -20,11 +20,26 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - uses: actions/setup-node@v4
+        if: matrix.python-version == '3.11'
+        with:
+          node-version: '20'
+
       - name: Install
         run: pip install -e ".[dev]"
 
       - name: Run tests
         run: pytest -v
+
+      - name: Lint the Node bridge
+        # `node --check` validates syntax only -- it accepts a name that is
+        # used but never declared. That is how a call site once gained an
+        # argument the function never took, turning every table search into a
+        # ReferenceError and a permanent retry loop.
+        if: matrix.python-version == '3.11'
+        run: |
+          npm ci || npm install
+          npm run lint
 
       - name: Check the SDK imports without the live extra
         run: |
