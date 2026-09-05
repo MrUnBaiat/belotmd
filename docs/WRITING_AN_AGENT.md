@@ -67,8 +67,12 @@ state.impossible_cards[seat]  cards that seat provably CANNOT hold
 
 `known_cards` is populated from declared combinations (a declared 5-card run
 pins five cards at once), the seven-swap, and the face-up card.
-`impossible_cards` is populated from voids — a player who fails to follow suit
-cannot hold that suit.
+
+`impossible_cards` has two sources: a player who fails to follow suit cannot
+hold that suit, and the **edges of a declared run** — runs are reported
+maximally, so a J-Q-K also proves its holder has neither the 10 nor the ace.
+(A five-run only proves the upper edge; the enum stops there, so a six-run
+looks identical.)
 
 Reconstructing those two arrays from a partial, frequently stale server feed is
 most of what this SDK does.

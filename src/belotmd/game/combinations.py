@@ -126,6 +126,64 @@ def decode_field(value, ascii_to_id):
     return sorted(cards), unknown
 
 
+# The platform reports a run MAXIMALLY -- it always shows the longest one the
+# hand contains -- with a single exception: the enum stops at O_SUTA, so a run
+# of six or more is reported as its TOP FIVE.
+#
+# That maximality is information beyond the cards themselves. If a declared run
+# could have been extended, it would have been, so the ranks immediately
+# outside it are provably NOT held:
+#
+#     3-run "1x"   card above absent    card below absent
+#     4-run "2x"   card above absent    card below absent
+#     5-run "3x"   card above absent    card below UNKNOWN  <- the exception
+#
+# The 5-run keeps the "above" half: the reported top card is still the highest
+# of the run, or a longer run would have been reported ending higher. It loses
+# the "below" half, because a six-run is exactly what a five-run looks like.
+#
+# Four of a kind and bella imply nothing: they are not runs, and holding the
+# neighbouring rank would not have changed what was declared.
+MAX_REPORTED_RUN = 5
+
+RANK_ACE = 7
+
+
+def excluded(type_id, card_char, ascii_to_id):
+    """-> card ids the declarer provably does NOT hold, from a run's edges.
+
+    Returns [] for anything that is not a run, and for a malformed token --
+    a wrong exclusion is a false void, which quietly removes a real candidate
+    from every belief and every sampled world.
+    """
+    n = RUN_LENGTH.get(type_id)
+    if n is None:
+        return []
+
+    card = ascii_to_id.get(card_char)
+    if card is None:
+        return []
+    suit, rank = card // 8, card % 8
+    if rank - (n - 1) < 0:              # run falls off the bottom: malformed
+        return []
+
+    out = []
+    if rank < RANK_ACE:                 # nothing sits above the ace
+        out.append(suit * 8 + rank + 1)
+    below = rank - n
+    if below >= 0 and n < MAX_REPORTED_RUN:
+        out.append(suit * 8 + below)
+    return sorted(out)
+
+
+def excluded_field(value, ascii_to_id):
+    """'1x|2c' -> sorted card ids nobody declaring that could be holding."""
+    out = set()
+    for type_id, ch in parse_field(value):
+        out.update(excluded(type_id, ch, ascii_to_id))
+    return sorted(out)
+
+
 def declarable(value, ascii_to_id=None, include_win_all=False,
                include_four_sevens=True, include_four_eights=False):
     """Which tokens from a combinationsCanShow field we should announce.

@@ -286,6 +286,24 @@ class StateSynchronizer:
         self.state.known_cards[seat, card] = True
         return True
 
+    def _mark_impossible(self, seat, card):
+        """Record that `seat` cannot hold `card`. -> True if this is new.
+
+        Refuses to contradict a certainty. A card cannot be both provably held
+        and provably absent, so if that ever happens one of the two inferences
+        is wrong and the safe move is to keep the stronger one (the pin, which
+        comes from cards the player actually showed) and say so.
+        """
+        if self.state.known_cards[seat, card]:
+            print(f"[Sync][WARN] seat {seat}: {ID_TO_ASCII.get(card)} is "
+                  f"pinned as held but a declared run implies it is not; "
+                  f"keeping the pin and ignoring the exclusion")
+            return False
+        if self.state.impossible_cards[seat, card]:
+            return False                       # already known
+        self.state.impossible_cards[seat, card] = True
+        return True
+
     def apply_seven_swap(self, who, seven, top):
         """A player traded the 7 of trump for the face-up card.
 
@@ -377,6 +395,21 @@ class StateSynchronizer:
         if applied:
             print(f"[Sync] seat {seat} declared '{value}' -> "
                   f"{[ID_TO_ASCII[c] for c in applied]} pinned in belief state")
+
+        # The run's EDGES are information too. A run is reported maximally, so
+        # if it could have been extended it would have been -- the ranks just
+        # outside it are provably not held. (Five-runs keep only the upper
+        # edge: the enum stops there, so a six-run looks exactly like one.)
+        #
+        # Only after the clash check above: if the decoding were wrong, these
+        # would be false voids, which is worse than a missing pin. A void
+        # silently removes a real candidate from every belief and every
+        # sampled world, and nothing downstream can tell it from a true one.
+        barred = [c for c in combo.excluded_field(value, ASCII_TO_ID)
+                  if self._mark_impossible(seat, c)]
+        if barred:
+            print(f"[Sync] seat {seat} '{value}' is maximal -> "
+                  f"{[ID_TO_ASCII[c] for c in barred]} ruled out of their hand")
 
     # ------------------------------------------------------------------ beliefs
     def _mark_voids(self, trick):

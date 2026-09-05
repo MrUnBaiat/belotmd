@@ -377,6 +377,34 @@ Runs use natural rank order, so a run of length *n* ending at rank *r* covers
 ranks *r-n+1 .. r*. A run that would fall off the bottom of the suit is
 malformed and should be discarded rather than guessed at.
 
+### Runs are reported maximally **[DERIVED]**
+
+The server always shows the **longest** run in the hand, which makes a
+declaration say something about the cards it does *not* contain: if the run
+could have been extended it would have been, so the ranks immediately outside
+it are provably not held.
+
+One exception, and it matters. The enum stops at `O_SUTA`, so a run of six or
+more is reported as its **top five**. That preserves the upper edge — the
+reported top card is still the highest, or a longer run would have been
+reported ending higher — and destroys the lower one, because a six-run is
+indistinguishable from a five-run with a card underneath it.
+
+| Declaration | card above absent | card below absent |
+|---|---|---|
+| 3-run `1x` | ✅ | ✅ |
+| 4-run `2x` | ✅ | ✅ |
+| 5-run `3x` | ✅ | ❌ — could be the top of a longer run |
+| four of a kind `4x` | — | — |
+| bella `5x` | — | — |
+
+Four of a kind and bella imply nothing: they are not runs, and holding a
+neighbouring rank would not have changed what was declared.
+
+Worth the care, because a wrong exclusion is a **false void** — it silently
+removes a real candidate from every belief and every sampled world, and
+nothing downstream can tell it from a true one.
+
 ### Scoring rules **[CONFIRMED by cross-checking `c` against declarations]**
 
 - **Only the best sequence scores.** In one hand a Q-high and a 9-high tercă
