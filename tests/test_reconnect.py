@@ -305,14 +305,58 @@ def test_a_seat_shuffle_after_the_cut_is_flagged_as_impossible(capsys):
     assert ws.joins == 2, "still resyncs rather than ending the run"
 
 
-def test_the_match_started_flag_survives_a_cancelled_deal():
-    """A cancelled deal drops back through phases 1-2; that is not a return
-    to the lobby, so a later shuffle must still read as impossible."""
+def test_a_cancelled_deal_still_counts_as_mid_match(capsys):
+    """A cancelled deal drops back through phases 1-2 and deals again. That is
+    not a return to the lobby, so a shuffle there is still impossible."""
     ws, _, _ = _run_connect([
         {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
         {"event": "STATE", "data": {"currentPhase": 10}},
         {"event": "STATE", "data": {"currentPhase": 1}},      # deal cancelled
-        {"event": "STATE", "data": {"currentPhase": 2}},
+        {"event": "STATE", "data": {"currentPhase": 2}},      # dealing again
         {"event": "LEAVE", "code": LEAVE_POSITION_CHANGED},
     ])
+    assert "VIOLATION" in capsys.readouterr().out
+    assert ws.joins == 2
+
+
+@pytest.mark.parametrize("phase,underway", [
+    (0, False),   # lobby, before a match
+    (1, False),   # STARTED
+    (2, True),    # the cut -- seats are fixed from here
+    (10, True),   # playing
+    (12, True),   # a claim resolving
+    (13, False),  # between hands, or the last one just ended
+    (14, False),  # match over; the next one begins in this same room
+])
+def test_which_phases_count_as_a_hand_in_progress(phase, underway):
+    """The question is about NOW, not history -- one room hosts many matches.
+
+    13 is treated as idle deliberately. It is both "between hands" and "the
+    match just ended", and they are indistinguishable from the phase alone;
+    a false VIOLATION on every match boundary is worse than missing an event
+    the platform says cannot happen.
+    """
+    from belotmd.platform.protocol import match_underway
+    assert match_underway(phase) is underway
+
+
+def test_a_reseat_between_matches_is_routine_not_a_violation(capsys):
+    """One room connection hosts MANY consecutive matches -- a match ending
+    goes 13 -> 14 -> 0 and the next one starts in the same room. So "has a
+    match ever started here" is the wrong question: it latches True during
+    match 1 and never returns, and every legal inter-match reseat after that
+    trips the assertion."""
+    ws, _, _ = _run_connect([
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+        {"event": "STATE", "data": {"currentPhase": 2}},    # match 1: the cut
+        {"event": "STATE", "data": {"currentPhase": 10}},   # ... playing
+        {"event": "STATE", "data": {"currentPhase": 13}},   # hand over
+        {"event": "STATE", "data": {"currentPhase": 14}},   # match over
+        {"event": "STATE", "data": {"currentPhase": 0}},    # idle again
+        {"event": "LEAVE", "code": LEAVE_POSITION_CHANGED}, # host sets teams
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+    ])
+    out = capsys.readouterr().out
+    assert "VIOLATION" not in out, (
+        "a seat shuffle between matches is exactly what 4005 is for")
     assert ws.joins == 2

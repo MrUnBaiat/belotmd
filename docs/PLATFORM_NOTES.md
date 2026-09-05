@@ -148,8 +148,15 @@ Meanings, from the platform's own enum plus what each looks like live:
 `4003` is by far the most common in a long run, and it is not a failure. A
 client that treats it as one plays a single table and stops.
 
-`4005` is bounded: once a match is under way — from the deck cut onward, not
-from the first bid — the host can no longer rotate seats, so it cannot occur.
+`4005` is bounded: while a **hand is in progress** — from the deck cut
+(phase 2) through to it being scored — the host can no longer rotate seats, so
+it cannot occur.
+
+Note the bound is on *now*, not on history. **One room connection hosts many
+consecutive matches**: a match ends `13 -> 14 -> 0`, everyone readies up, and
+the next one deals in the same room. So a client that latches "a match has
+started here" gets it wrong from the second match onward and reports every
+legal inter-match reseat as impossible.
 That makes it a useful assertion. A `4005` after the cut would mean seat
 indices moved underneath every belief we hold, and that the platform does not
 behave the way this document claims. **[CONFIRMED by the platform's own

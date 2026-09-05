@@ -73,6 +73,22 @@ LEAVE_NAMES = {
 }
 
 
+# Phases during which a HAND IS IN PROGRESS and the seats are therefore fixed.
+# Everything outside this is a boundary the table sits idle at: 0/1 before a
+# match, 13 between hands, 14 after the last one.
+#
+# Note this is a question about NOW, not about history. One room connection
+# hosts many consecutive matches -- a match ends 13 -> 14 -> 0 and the next
+# starts in the same room -- so "has a match ever begun here" latches True
+# during the first one and never returns.
+IN_PLAY_PHASES = range(PUSH_CARDS, ROUND_ENDED)     # 2..12
+
+
+def match_underway(phase):
+    """Is a hand in progress right now? Seats cannot move while it is."""
+    return phase in IN_PLAY_PHASES
+
+
 # ------------------------------------------------------ recovery policy
 # What to do when a room closes. Most of these are ordinary events in a long
 # session, not failures: a table dissolving at the end of a match is how every

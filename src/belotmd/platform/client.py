@@ -14,10 +14,9 @@ import time
 import websockets
 
 from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
-                       LEAVE_KICKED, LEAVE_POSITION_CHANGED, PUSH_CARDS,
-                       RECOVER_LATER,
-                       RECOVER_NOW, RECOVER_SOON, RECOVER_STOP,
-                       SUIT_TO_INT, leave_recovery)
+                       LEAVE_KICKED, LEAVE_POSITION_CHANGED, NOT_STARTED,
+                       RECOVER_LATER, RECOVER_NOW, RECOVER_SOON, RECOVER_STOP,
+                       SUIT_TO_INT, leave_recovery, match_underway)
 
 
 class BelotClient:
@@ -45,7 +44,7 @@ class BelotClient:
         self.room_id = None
         self._queue = None
         self._consumer = None
-        self._match_started = False
+        self._phase = NOT_STARTED
         self._in_room = False
 
     # How long to wait for `node bridge.js` to bind BRIDGE_PORT.
@@ -120,7 +119,7 @@ class BelotClient:
                     self.room_id = msg.get("roomId")
                     self.my_player_id = msg.get("playerId")
                     self._in_room = True
-                    self._match_started = False
+                    self._phase = NOT_STARTED
                     self.sessions_played += 1
                     print(f"[SDK] Joined Game Room: {self.room_id} | Player ID: {self.my_player_id}")
                     await self.deactivate_bot()
@@ -134,12 +133,13 @@ class BelotClient:
                     # legal mask and silently dropping our turn.
                     # It also leaked the task -- asyncio only keeps a weak
                     # reference, so an un-stored task can be GC'd mid-flight.
-                    # The match is underway from the deck cut (phase 2),
-                    # not from the first bid. Sticky for the room session:
-                    # a cancelled deal drops back through phases 1-2 without
-                    # meaning we returned to the lobby.
-                    if (msg.get("data") or {}).get("currentPhase", 0) >= PUSH_CARDS:
-                        self._match_started = True
+                    #
+                    # Remember the phase rather than latching "a match has
+                    # started": one room hosts many consecutive matches, so a
+                    # latch never returns and every legal reseat between them
+                    # reads as impossible.
+                    self._phase = (msg.get("data") or {}).get(
+                        "currentPhase", self._phase)
                     await self._queue.put(("STATE", msg["data"]))
 
                 elif event == "MESSAGE" and on_message_callback:
@@ -168,19 +168,19 @@ class BelotClient:
                     if label == "UNKNOWN":
                         print(f"[SDK][WARN] unrecognised close code {code}; "
                               f"treating it as recoverable.")
-                    if code == LEAVE_POSITION_CHANGED and self._match_started:
+                    if (code == LEAVE_POSITION_CHANGED
+                            and match_underway(self._phase)):
                         # A cheap assertion on a platform invariant: the host
-                        # can only rotate seats BETWEEN joining a table and the
-                        # match starting. Once it is under way this cannot
-                        # happen, so if it ever does, something about the
-                        # platform is not what we think it is -- say so
-                        # unmistakably. We still resync rather than end an
-                        # unattended run, and the synchronizer will flag the
-                        # hand as degraded.
+                        # can only rotate seats while the table is IDLE -- before
+                        # a match, or between them. Mid-hand it cannot happen,
+                        # so if it ever does, something about the platform is
+                        # not what we think it is. We still resync rather than
+                        # end an unattended run, and the synchronizer will flag
+                        # the hand as degraded.
                         print("=" * 72)
                         print(f"[SDK][VIOLATION] {label} ({code}) AFTER the "
-                              f"match began. This is not supposed to be "
-                              f"possible.")
+                              f"match began (phase {self._phase}). This "
+                              f"is not supposed to be possible.")
                         print("                 Seat indices have moved, so "
                               "every seat-indexed belief is now wrong.")
                         print("                 Resyncing, but keep the "
@@ -203,7 +203,7 @@ class BelotClient:
         the first open table, would very likely hand us straight back to it.
         """
         self._in_room = False
-        self._match_started = False
+        self._phase = NOT_STARTED
         await ws.send(json.dumps({"action": "CONNECT",
                                   "cookies": self.cookies,
                                   "avoidLast": bool(avoid_last)}))
