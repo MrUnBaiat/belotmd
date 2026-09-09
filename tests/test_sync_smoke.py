@@ -1,7 +1,9 @@
 """
 smoke_test.py — offline validation of belot_sync v2 + sync_auditor.
 
-Frame 1 is the REAL captured belot.md payload (mid-hand join scenario).
+Frame 1 is a REAL captured belot.md payload (mid-hand join scenario), with the
+player ids replaced by synthetic ones -- the last digit is the seat index. Only
+the ids were changed; every field the synchronizer reads is as it arrived.
 Frames 2-4 are synthetic continuations exercising: mid-trick void inference,
 trick completion via lastCards, points/score decoding, new-hand reset, and
 bolt detection from the roundTotals `b` field.

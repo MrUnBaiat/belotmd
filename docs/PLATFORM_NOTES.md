@@ -170,7 +170,8 @@ path, but it needs the same treatment: wait, then look again.
 
 ## 4. State payload
 
-One frame, trimmed to the fields that matter:
+One frame, trimmed to the fields that matter. The player ids are synthetic
+(last digit = seat); everything else is as it arrived:
 
 ```json
 {
