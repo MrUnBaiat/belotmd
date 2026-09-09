@@ -8,6 +8,13 @@ carry the *previous* hand's value until the moment they are recomputed. Get one
 of them wrong and your move is refused, your turn times out, and the site hands
 your seat to its own bot for the rest of the session.
 
+None of it is documented. I worked the protocol out myself, from captured live
+traffic and the site's own client JavaScript: the card encoding, the phase
+machine, which state fields lie and when, how a trick is really reconstructed,
+and how the scoring actually adds up. That write-up is
+[docs/PLATFORM_NOTES.md](docs/PLATFORM_NOTES.md), and it is the part of this
+repository I would point at first.
+
 This library handles all of that. You write the part that decides which card to
 play.
 
@@ -52,10 +59,12 @@ a recording through a fresh synchronizer deterministically, and an independent
 inspector that shares no code with the sync layer gives a second opinion. Any
 bug you hit live is reproducible forever.
 
-**Documented protocol.** [docs/PLATFORM_NOTES.md](docs/PLATFORM_NOTES.md) is the
-reverse-engineering write-up: card encoding, phase enum, message protocol, the
-field trust table, trick reconstruction, scoring quirks, the seat-takeover
-behaviour. Every claim marked CONFIRMED / DERIVED / ASSUMED.
+**Findings you can audit.** Every claim in
+[docs/PLATFORM_NOTES.md](docs/PLATFORM_NOTES.md) is marked with how it was
+established — **CONFIRMED** against captured traffic, **DERIVED** from the
+site's `gameplay.js`, or still **ASSUMED**. The field trust table is the part
+worth reading: it lists which state fields carry the previous hand's value and
+for how long, and most integration bugs are one of those rows being believed.
 
 ## Install
 
