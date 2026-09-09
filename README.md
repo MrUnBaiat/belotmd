@@ -1,5 +1,7 @@
 # belotmd
 
+[![tests](https://github.com/MrUnBaiat/belotmd/actions/workflows/tests.yml/badge.svg)](https://github.com/MrUnBaiat/belotmd/actions/workflows/tests.yml)
+
 An SDK for building bots that play Belot on [belot.md](https://belot.md).
 
 The platform has no API. It speaks msgpack over Colyseus WebSockets, only ever
