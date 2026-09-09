@@ -69,6 +69,26 @@ class LiveBelotBot:
             print(f"[Bot] AUDIT mode on: recording frames to "
                   f"{self.config.frames_path}")
 
+    # `act` is the only method an agent must supply. reset/snapshot/restore
+    # exist for agents that carry state across turns, and the docs promise they
+    # are no-ops otherwise -- so a stateless agent should not have to write
+    # three empty methods just to avoid an AttributeError on the first hand
+    # boundary. Looked up per call rather than bound at construction, so that
+    # no construction path can forget to wire them.
+    def _agent_reset(self):
+        fn = getattr(self.agent, "reset", None)
+        if fn is not None:
+            fn()
+
+    def _agent_snapshot(self):
+        fn = getattr(self.agent, "snapshot", None)
+        return fn() if fn is not None else None
+
+    def _agent_restore(self, snapshot):
+        fn = getattr(self.agent, "restore", None)
+        if fn is not None:
+            fn(snapshot)
+
     def _reset_room_state(self):
         """Everything that describes THE TABLE WE ARE AT, in one place.
 
@@ -106,7 +126,7 @@ class LiveBelotBot:
                       f"state.")
             self._room_seq = seq
             self._reset_room_state()
-            self.agent.reset()
+            self._agent_reset()
 
     async def on_state_update(self, raw_state: dict, my_player_id: str):
         try:
@@ -129,7 +149,7 @@ class LiveBelotBot:
         # phase frames). A recurrent agent zeroes its hidden state here, which
         # is what training did at the start of every episode.
         if self.sync_engine.consume_new_hand():
-            self.agent.reset()
+            self._agent_reset()
             self.last_action_turn_id = None
 
         if self.audit:
@@ -177,7 +197,7 @@ class LiveBelotBot:
         # for -- silently, since nothing rejected anything. We simply never
         # sent it, and sat in the lobby forever.
         if phase == NOT_STARTED or phase in END_PHASES:
-            self.agent.reset()
+            self._agent_reset()
             if not self._server_says_ready(raw_state, my_pos):
                 await self._send_ready_debounced()
             return
@@ -447,9 +467,9 @@ class LiveBelotBot:
 
         if self._turn_decision is not None and self._turn_decision[0] == turn_id:
             _, snapshot, refused = self._turn_decision
-            self.agent.restore(snapshot)          # replay, don't chain
+            self._agent_restore(snapshot)          # replay, don't chain
         else:
-            snapshot, refused = self.agent.snapshot(), set()
+            snapshot, refused = self._agent_snapshot(), set()
             self._turn_decision = (turn_id, snapshot, refused)
 
         legal_mask = state.get_legal_actions().astype(np.int8)

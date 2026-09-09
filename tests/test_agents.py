@@ -90,3 +90,50 @@ def test_action_space_constants_match_the_state():
     assert BelotState().action_space_size == actions.ACTION_SPACE_SIZE == 38
     assert actions.suit_of(actions.ACTION_SUIT_BASE + 2) == 2
     assert actions.suit_of(actions.ACTION_PASS) is None
+
+
+def test_act_is_the_only_method_an_agent_must_supply():
+    """The README's headline example is five lines with a single method. It
+    used to crash on the first hand boundary, because bot.py called reset()
+    unconditionally -- the first thing anyone copies, broken."""
+    from belotmd.bot import LiveBelotBot
+
+    class Minimal:
+        def act(self, state, seat, match_scores, legal_mask):
+            return int(np.flatnonzero(legal_mask)[0])
+
+    bot = LiveBelotBot.__new__(LiveBelotBot)
+    bot.agent = Minimal()
+
+    bot._agent_reset()                       # must not raise
+    assert bot._agent_snapshot() is None
+    bot._agent_restore(None)
+
+
+def test_a_stateful_agent_still_has_its_hooks_called():
+    """The other half: making them optional must not make them ignored."""
+    from belotmd.bot import LiveBelotBot
+
+    calls = []
+
+    class Stateful:
+        def act(self, *a):
+            return 0
+
+        def reset(self):
+            calls.append("reset")
+
+        def snapshot(self):
+            calls.append("snapshot")
+            return "S"
+
+        def restore(self, snap):
+            calls.append(("restore", snap))
+
+    bot = LiveBelotBot.__new__(LiveBelotBot)
+    bot.agent = Stateful()
+
+    bot._agent_reset()
+    assert bot._agent_snapshot() == "S"
+    bot._agent_restore("S")
+    assert calls == ["reset", "snapshot", ("restore", "S")]

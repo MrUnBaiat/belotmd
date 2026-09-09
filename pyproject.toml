@@ -36,9 +36,9 @@ live = ["websockets>=12.0"]
 dev = ["websockets>=12.0", "pytest>=7.0"]
 
 [project.urls]
-Homepage = "https://github.com/cristipojoga/belotmd"
-Documentation = "https://github.com/cristipojoga/belotmd/blob/main/docs/PLATFORM_NOTES.md"
-Issues = "https://github.com/cristipojoga/belotmd/issues"
+Homepage = "https://github.com/MrUnBaiat/belotmd"
+Documentation = "https://github.com/MrUnBaiat/belotmd/blob/main/docs/PLATFORM_NOTES.md"
+Issues = "https://github.com/MrUnBaiat/belotmd/issues"
 
 [project.scripts]
 belot-bot = "belotmd.cli:main"

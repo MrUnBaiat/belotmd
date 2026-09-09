@@ -15,15 +15,18 @@ play.
 from belotmd import register
 import numpy as np
 
-@register("random")
+@register("my-agent")
 class MyAgent:
     def act(self, state, seat, match_scores, legal_mask):
+        """`legal_mask` is authoritative — never return a masked-out index."""
         return int(np.random.choice(np.flatnonzero(legal_mask)))
 ```
 
 ```bash
 belot-bot --agent my-agent
 ```
+
+That is the whole contract. `act` is the only method you must write.
 
 ---
 
@@ -56,14 +59,19 @@ behaviour. Every claim marked CONFIRMED / DERIVED / ASSUMED.
 
 ## Install
 
+Not on PyPI yet — clone and install in place:
+
 ```bash
-pip install belotmd[live]     # numpy + websockets
+git clone https://github.com/MrUnBaiat/belotmd
+cd belotmd
+pip install -e ".[live]"      # numpy + websockets
 npm install                   # colyseus.js + ws, for the bridge
 ```
 
-`pip install belotmd` alone gives you the rules and belief layers with numpy as
-the only dependency — enough to develop and test an agent offline. The `live`
-extra adds what is needed to actually join a table.
+`pip install -e .` without the extra gives you the rules and belief layers with
+numpy as the only dependency — enough to write and test an agent entirely
+offline. The `live` extra adds what is needed to actually join a table, and the
+bridge needs Node 18+.
 
 Credentials go in `.env`:
 
@@ -157,7 +165,12 @@ selected.
 ## Verification
 
 ```bash
-pytest
+pytest                                    # 128 tests, no network needed
+```
+
+After a live session you also have a recording to replay:
+
+```bash
 python -c "from belotmd.audit import replay; replay('frames.jsonl')"
 python tools/frame_inspector.py frames.jsonl
 ```
