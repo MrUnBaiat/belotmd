@@ -813,6 +813,15 @@ class StateSynchronizer:
             if declared and i != self.my_pos:
                 self.apply_combination(i, declared)
 
+        # The field is also exposed verbatim, for an agent that scores the hand
+        # the way belot.md does: the bolt test and the stakes count combination
+        # points (docs/PLATFORM_NOTES.md §6.4-6.5). Declarations are made up to
+        # the last card of trick 2 and the server removes the losers once trick
+        # 2 completes, so from trick 3 what stands is what scores.
+        # Gated to play like `points` below; `reset()` empties it at the deal.
+        if self.state.phase == "PLAYING" and len(players) == 4:
+            self.state.combinations = [p.get("combinations") or "" for p in players]
+
         # 7. Match scores + bolts -------------------------------------------
         # scoreTable rows are CUMULATIVE (row deltas == roundTotals.b) and
         # col0/col1 are the position-parity teams (user-confirmed), matching

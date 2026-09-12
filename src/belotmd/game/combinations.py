@@ -247,3 +247,57 @@ CLAIM_FILLER = "a"
 
 def claim_token(type_id):
     return f"{type_id}{CLAIM_FILLER}"
+
+
+# ------------------------------------------------------------------ scoring
+# Points as belot.md pays them (docs/PLATFORM_NOTES.md §7): runs by length,
+# four of a kind by rank, bella 20. Claims (types 6-9) score nothing here.
+#
+# They matter beyond bookkeeping: the platform bolts the declaring team on
+# trick points PLUS combination points, and pays 16 + all combinations/10
+# rather than a flat 16 (§6). Read off 897 recorded hands, 897/897 reproduced.
+RUN_POINTS = {TART: 20, JUMATE_DE_SUTA: 50, O_SUTA: 100}
+BELA_POINTS = 20
+
+
+def points(value, ascii_to_id):
+    """'2l|5k' -> (combination points, bella points) declared in one field.
+
+    Tolerates junk the way `parse_field` does: an unreadable token scores 0."""
+    combo, bella = 0, 0
+    for type_id, ch in parse_field(value):
+        if type_id in RUN_POINTS:
+            combo += RUN_POINTS[type_id]
+        elif type_id == PATRU_CARTI:
+            rank = four_rank(type_id, ch, ascii_to_id)
+            if rank is not None:
+                combo += FOUR_POINTS.get(rank, 100)
+        elif type_id == BELA:
+            bella += BELA_POINTS
+    return combo, bella
+
+
+def team_points(fields, ascii_to_id):
+    """Four per-seat `combinations` fields -> (team 0 points, team 1 points).
+
+    Teams are seat parity. Declarations are made up to the last card of trick 2
+    and the server removes the losers once trick 2 completes, so from trick 3
+    summing what stands IS what will score. Checked against the
+    published per-team totals on 897 recorded hands: 99.3% exact at trick 3
+    and 100% by trick 7, the misses being a bella scored without a token.
+    """
+    c = [0, 0]
+    for seat, value in enumerate(fields):
+        combo, bella = points(value, ascii_to_id)
+        c[seat % 2] += combo + bella
+    return c[0], c[1]
+
+
+def bela_declared(fields):
+    """Seat whose field carries a bella token, else None. Bella is announced
+    when the first of the trump Q/K pair is played, so its absence early in
+    the hand means 'not yet known', not 'nobody holds it'."""
+    for seat, value in enumerate(fields):
+        if any(t == BELA for t, _ in parse_field(value)):
+            return seat
+    return None

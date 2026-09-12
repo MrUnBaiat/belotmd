@@ -47,6 +47,8 @@ state.graveyard            every card already played
 state.tricks_played        0-8
 state.raw_points_by_team   trick points captured so far
 state.bolts_by_team        bolt counters
+state.combinations[seat]   that seat's declared combinations as the server
+                           settled them ("2l|5k"); see PLATFORM_NOTES §6.4
 state.get_legal_actions()  the full legal mask
 state.card_value(card, is_trump) -> (points, trick power)
 ```
@@ -67,6 +69,24 @@ state.impossible_cards[seat]  cards that seat provably CANNOT hold
 
 `known_cards` is populated from declared combinations (a declared 5-card run
 pins five cards at once), the seven-swap, and the face-up card.
+
+### The hand is scored with combinations in it
+
+belot.md bolts the declaring team on trick points *plus* declared combinations
+and pays `16 + all combinations // 10`, not a flat 16 (PLATFORM_NOTES §6.4).
+An agent that values positions by "will we reach 81?" is aiming at a line the
+server moves on two hands in three. From trick 3, `state.combinations` holds
+what will actually score, and
+
+```python
+from belotmd.game import combinations as combo
+from belotmd.platform.protocol import ASCII_TO_ID
+c_team0, c_team1 = combo.team_points(state.combinations, ASCII_TO_ID)
+```
+
+gives each team's points to add to its trick points before applying the bolt
+test. Bella is announced only when its holder plays the first of the trump
+Q/K pair, so before that it is unknown rather than absent.
 
 `impossible_cards` has two sources: a player who fails to follow suit cannot
 hold that suit, and the **edges of a declared run** — runs are reported

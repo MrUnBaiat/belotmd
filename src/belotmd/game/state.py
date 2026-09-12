@@ -88,6 +88,14 @@ class BelotState:
         # synchronizer; always False offline.
         self.beliefs_degraded = False
 
+        # Each seat's declared combinations, verbatim wire tokens ("2l|5k"),
+        # as the server's per-player `combinations` field stands. Always empty
+        # offline. Filled by the synchronizer during play, by which point the
+        # server has settled which declarations score -- an agent that scores
+        # the hand the way belot.md does (bolts on trick + combination points)
+        # reads it through `combinations.team_points`.
+        self.combinations = ["", "", "", ""]
+
         self.time_left_s = None
         self.turn_budget_s = None
         self.deadline = None

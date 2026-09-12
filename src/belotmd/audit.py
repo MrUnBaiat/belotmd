@@ -58,6 +58,9 @@ class Auditor:
         self._trump_bid_sampled = False
         self._trump_divergences = set()
         self._prev_rt_str = None
+        # The last play frame's per-seat `combinations` field, compared against
+        # the published per-team `c` when the hand's summary lands.
+        self._last_combos = None
         self._last_team_points = None
         self._points_cap_flagged = False
         self._hand_id = None
@@ -104,6 +107,11 @@ class Auditor:
             return
         phase = raw_state.get("currentPhase", 0)
         players = raw_state.get("players", [])
+        # Phase 10 frames only -- the selection the 897-hand validation used.
+        # Any-PLAYING (>= 10) and 10-11 both measured worse on the recordings
+        # (12 and 18 mismatches against this rule's baseline; see below).
+        if phase == 10 and getattr(env, "combinations", None):
+            self._last_combos = list(env.combinations)
 
         # Once phase hits 13/14 the server deals the NEXT hand into `cards`
         # while this hand's graveyard is still live: any overlap there is
@@ -422,6 +430,32 @@ class Auditor:
                        if p0 + p1 == 162 else
                        f"*** p0+p1 == {p0 + p1}, expected 162 -- raw-points "
                        f"semantics changed; features may be out of distribution")
+            # An agent that scores the hand the platform's way (bolt on trick
+            # points PLUS combinations, PLATFORM_NOTES §6.4) reads each seat's
+            # `combinations` field as the settled contest. Hold it to the
+            # published `c`, so a change in what the field means surfaces here
+            # rather than silently inside the agent's scoring.
+            # Baseline on 30 recordings, 900 summaries: 881 exact, 7 bella
+            # without a token, 2 capot, 9 unexplained, 1 with no field -- five
+            # in one recording whose hand counter stuck, so the field there
+            # belonged to another hand. A live run reading more than ~1%
+            # unexplained is the signal.
+            if self._last_combos is not None:
+                f0, f1 = combo.team_points(self._last_combos, ASCII_TO_ID)
+                if (f0, f1) == (c0, c1):
+                    verdict += ";  combinations field OK"
+                elif p0 == 0 or p1 == 0:
+                    verdict += (f";  combinations field c({f0},{f1}) vs published "
+                                f"c({c0},{c1}) -- a capot voids that team's "
+                                f"combinations; benign")
+                elif sorted((c0 - f0, c1 - f1)) == [0, 20]:
+                    verdict += (f";  combinations field c({f0},{f1}) vs published "
+                                f"c({c0},{c1}) -- a bella scored without a token; "
+                                f"known, benign")
+                else:
+                    verdict += (f";  *** combinations field says c({f0},{f1}) vs "
+                                f"published c({c0},{c1}) -- unexplained; a run of "
+                                f"these means the field no longer says what scores")
             self._emit("PROBE",
                        f"hand scored: p({p0},{p1}) c({c0},{c1}) -> {verdict}")
         self._prev_rt_str = rt_str

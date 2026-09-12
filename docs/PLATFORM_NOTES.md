@@ -351,6 +351,74 @@ Live trick captures for that player, **excluding** combination points.
 
 Team raw points are `points[0]+points[2]` and `points[1]+points[3]`.
 
+### 6.4 The bolt test counts combinations **[CONFIRMED on 897 hands]**
+
+A solver written against a meld-free simulator bolts the declaring team on
+trick points alone (`<= 80` of 162). belot.md does not. Read off 897 recorded
+hands with a play-time declarer (`p`, `c`, `b` per team from `roundTotals`),
+and reproduced on every one of them:
+
+```
+bolted   iff  p_dec + c_dec <  p_def + c_def
+              defenders take 16 + (c_dec + c_def) // 10  -- the declarer's
+              combinations included; the declarer scores 0 (a BT-N cell)
+tie           p_dec + c_dec == p_def + c_def: each team rounds its own
+              total (bile); the declarer is never bolted on a tie   [7/7]
+made          b_def = bile(p_def + c_def),  b_dec = 16 + all // 10 - b_def
+capot         a team that took NO trick scores -10 and its combinations
+              are void; the other scores 16 + its own // 10   [19/19]
+```
+
+The trick-point-only rule contradicts the server on 8.8% of hands. The line
+moves on two hands in three, by 25 or more raw points on one in five, and the
+mean stake is 19.2, not 16 (max 41 seen).
+
+### 6.5 Which declarations score — the contest **[OWNER-CONFIRMED + CHECKED]**
+
+Declarations are made any time up to the **last card of trick 2**; once trick 2
+completes the server confirms the winners and removes the losers from the
+`combinations` field.
+
+The contest is **team against team** — there is no competition inside a team:
+
+1. rank by **points**;
+2. at equal points, a **four-of-a-kind beats a run** (a quad beats a five-run);
+3. then the **higher top card**;
+4. then the one **in trump**;
+5. equal points, equal top card and **neither in trump** → **both teams are
+   cancelled entirely**, a teammate's weaker combination included.
+
+The winning team scores **all** of its declarations. **Bella always scores** for
+whoever holds it, contest or not.
+
+Checked on 17 recorded hands that tied on (points, top card): in the 11 where
+neither was trump both teams scored nothing — including 3 where a teammate held
+a weaker combination, which scored nothing either — and in 5 of the 6 where one
+side was in trump that side took it. Rules 2 and 4 come from the platform's
+owner; no recorded hand distinguishes rule 2's order from top-card-first.
+
+**Where an agent reads the numbers.** Each seat's `combinations` field is the
+server's own resolution, so from trick 3 what stands is what scores. Mirrored
+verbatim on `state.combinations` during play; `combinations.team_points()` turns
+it into per-team points. Checked against the published `c` on 897 hands: 99.3%
+exact at trick 3, 100% by trick 7. Bella is announced only when the first of the
+trump Q/K pair is played, so its absence early means *unknown*, not *absent*.
+
+**The auditor holds the field to the published `c`** at every hand summary
+(`[AUDIT:PROBE] hand scored: ... combinations field OK`). Baseline over 30
+recordings, 900 summaries: 881 exact, 7 bella-without-a-token, 2 capots (a
+team with no tricks has its combinations voided while the field still shows
+them), 9 unexplained — five inside one recording whose hand counter stuck.
+
+The remaining four are **not** contest cancellations (§6.5): in each, the team
+whose declaration was not paid faced **no opposing declaration at all**. Three
+were paid nothing on an unopposed 20 or 70, and one was paid 20 on an unopposed
+50. **[OPEN]** — the likeliest mechanism is a declaration that appears in the
+field but is never confirmed at the trick-2 settlement. One of them also shows
+an unpaid bella, which contradicts "bella always scores", so a stale token is
+equally possible. More than ~1% unexplained in a live run is the signal that the
+field's meaning has changed.
+
 ---
 
 ## 7. Combinations and special declarations
@@ -424,6 +492,13 @@ nothing downstream can tell it from a true one.
 
 Both are declarations a naive "announce everything offered" policy will fire by
 accident, with effects nothing like the points it expected.
+
+### `BELOT_COMBO` ends the MATCH **[OWNER-CONFIRMED]**
+
+Type 7, nominally 1010 points: the holder has **all eight cards of trump**, and
+it ends the entire game rather than the hand. Never observed in 30 recordings,
+and at roughly one deal in ten million it never will be — but `AUTO_DECLARE`
+includes it, so a client that meets one declares it.
 
 ### Availability
 
