@@ -49,6 +49,8 @@ state.raw_points_by_team   trick points captured so far
 state.bolts_by_team        bolt counters
 state.combinations[seat]   that seat's declared combinations as the server
                            settled them ("2l|5k"); see PLATFORM_NOTES §6.4
+state.bot_seats[seat]      True while belot.md's own bot is playing that seat
+                           (a timed-out human); see PLATFORM_NOTES §10
 state.get_legal_actions()  the full legal mask
 state.card_value(card, is_trump) -> (points, trick power)
 ```

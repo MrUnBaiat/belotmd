@@ -579,9 +579,10 @@ information derived from it survives even though it scores nothing.
 
 **The most consequential platform behaviour, and the least documented.**
 
-When a turn times out, belot.md hands the seat to its own bot **for the rest of
-the session**. From that moment the server silently ignores every message the
-original client sends.
+When a turn times out, belot.md hands the seat to its own bot. For **our**
+client that lasts **the rest of the session**: from that moment the server
+silently ignores every message the original client sends. Other players, by
+contrast, routinely get their seats back — see *Other seats* below.
 
 The signature in a log is unmistakable once you know it: the client appears to
 play the *same card* in several consecutive tricks. The explanation is that the
@@ -600,6 +601,30 @@ against this — it only stops the bot playing your seat *before* a timeout.
 **The best defence is not triggering a timeout at all.** A rejected action that
 is simply re-sent will be rejected again until the turn expires, so a retry has
 to block the refused action and choose differently.
+
+### Other seats: replaced mid-match, and handed back **[MEASURED, 30 recordings]**
+
+The same timeout replaces other players, and it is common:
+
+| | |
+|---|---|
+| mid-match human → bot replacements | 70, in 44 matches (52 opponents, 18 partners) |
+| tables that *started* with a bot seat | 0 |
+| seats handed back to their human | 34 |
+| length of a bot stint | median 3 hands, max 9; 19 lasted a single hand |
+| scored hands with a bot in some seat during bidding or play | 160 of 1,098 (14.6%): opponent 113, partner 61 |
+| `connected` drops on other seats | 194, with 185 reconnects — most drops never reach a takeover |
+
+**Nothing marks it except the flag.** No message is broadcast and no hand is
+labelled; the only record, live or in a recording, is each player's `bot` field
+on every frame. `state.bot_seats` mirrors it, and the auditor logs an INFO line
+whenever another seat flips either way.
+
+**It matters for measurement.** A hand with a bot in another seat is not a hand
+against humans. In the recordings we scored **+1.89 ± 2.24** pts/hand with a bot
+opponent and **+0.29 ± 0.87** when all four seats were human (n=113 and 938) —
+not a significant gap, but the direction flatters any strength figure that mixes
+them, so report the two separately.
 
 ---
 

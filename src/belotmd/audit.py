@@ -61,6 +61,9 @@ class Auditor:
         # The last play frame's per-seat `combinations` field, compared against
         # the published per-team `c` when the hand's summary lands.
         self._last_combos = None
+        # Last seen `bot` flag per player, keyed by player id rather than seat
+        # so that a new table or a lobby rotation cannot look like a takeover.
+        self._bot_by_player = {}
         self._last_team_points = None
         self._points_cap_flagged = False
         self._hand_id = None
@@ -112,6 +115,25 @@ class Auditor:
         # (12 and 18 mismatches against this rule's baseline; see below).
         if phase == 10 and getattr(env, "combinations", None):
             self._last_combos = list(env.combinations)
+
+        # Another player handed to belot.md's bot, or given back. The platform
+        # announces neither, so this line is the only place it shows in a log.
+        # Our own seat is reported loudly by the bot itself (SEAT LOST).
+        if len(players) == 4:
+            for s, p in enumerate(players):
+                pid = p.get("id")
+                if s == me or pid is None:
+                    continue
+                now = bool(p.get("bot"))
+                was = self._bot_by_player.get(pid)
+                self._bot_by_player[pid] = now
+                if was is not None and was != now:
+                    rel = "partner" if s % 2 == me % 2 else "opponent"
+                    self._emit("INFO",
+                               f"seat {s} ({rel}) "
+                               + ("is now played by the platform bot" if now
+                                  else "is back with its human")
+                               + f" (round {raw_state.get('round')}, phase {phase})")
 
         # Once phase hits 13/14 the server deals the NEXT hand into `cards`
         # while this hand's graveyard is still live: any overlap there is

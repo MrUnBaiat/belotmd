@@ -96,6 +96,13 @@ class BelotState:
         # reads it through `combinations.team_points`.
         self.combinations = ["", "", "", ""]
 
+        # True while belot.md's own bot is playing that seat. The platform
+        # replaces a player whose turn times out and often hands the seat back
+        # a few hands later; nothing is announced either way, so the only
+        # record is each player's per-frame `bot` flag, mirrored here by the
+        # synchronizer on every frame. Always all-False offline.
+        self.bot_seats = [False, False, False, False]
+
         self.time_left_s = None
         self.turn_budget_s = None
         self.deadline = None

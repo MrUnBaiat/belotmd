@@ -822,6 +822,12 @@ class StateSynchronizer:
         if self.state.phase == "PLAYING" and len(players) == 4:
             self.state.combinations = [p.get("combinations") or "" for p in players]
 
+        # Which seats belot.md's bot is playing (docs/PLATFORM_NOTES.md §10).
+        # Mirrored on every frame rather than latched: a replaced human often
+        # gets the seat back a few hands later, and the flag is the only trace.
+        if len(players) == 4:
+            self.state.bot_seats = [bool(p.get("bot")) for p in players]
+
         # 7. Match scores + bolts -------------------------------------------
         # scoreTable rows are CUMULATIVE (row deltas == roundTotals.b) and
         # col0/col1 are the position-parity teams (user-confirmed), matching
