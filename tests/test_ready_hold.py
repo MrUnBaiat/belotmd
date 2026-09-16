@@ -259,6 +259,77 @@ def test_a_stranger_keeps_the_same_letter_while_we_sit_there():
     assert bot._seat_labels == first and len(first) == 2
 
 
+# ------------------------------------------------- the measured seat rule
+#
+# Captured live on 2026-09-16: the sender stays put and every other seat's
+# occupant moves one place forward. Empty seats take part, so this is a
+# positional cycle over the three non-sender chairs.
+
+def _rotate_once(layout):
+    """The rule as measured, with the sender at seat 0."""
+    out = list(layout)
+    for seat in (1, 2, 3):
+        out[(seat % 3) + 1] = layout[seat]
+    return tuple(out)
+
+
+CAPTURED = [
+    (("us", "A", "B", "partner"), ("us", "partner", "A", "B")),
+    (("us", "partner", "A", "empty"), ("us", "empty", "partner", "A")),
+    (("us", "C", "partner", "A"), ("us", "A", "C", "partner")),
+    (("us", "A", "C", "partner"), ("us", "partner", "A", "C")),
+]
+
+
+@pytest.mark.parametrize("before,after", CAPTURED)
+def test_the_rule_reproduces_what_the_platform_did(before, after):
+    """These four transitions are what the server actually produced. If the
+    rule we reason from ever stops explaining them, everything below is
+    wrong."""
+    assert _rotate_once(before) == after
+
+
+def test_three_rotations_return_the_table_to_where_it_started():
+    """The period is 3, not 4 -- our own seat is the fixed point."""
+    start = ("us", "A", "B", "partner")
+    once = _rotate_once(start)
+    assert _rotate_once(_rotate_once(once)) == start
+    assert once != start
+
+
+@pytest.mark.parametrize("my_pos", [0, 1, 2, 3])
+def test_the_rotation_count_is_arithmetic_not_a_search(my_pos):
+    need = LiveBelotBot._rotations_needed
+    assert need(my_pos, (my_pos + 2) % 4) == 0, "already opposite: do nothing"
+    assert need(my_pos, (my_pos + 1) % 4) == 1
+    assert need(my_pos, (my_pos + 3) % 4) == 2, "never more than two"
+
+
+def test_the_count_agrees_with_applying_the_rule():
+    """The arithmetic and the measured behaviour have to be the same thing."""
+    for partner_seat in (1, 2, 3):
+        layout = ["us", "X", "Y", "Z"]
+        layout[partner_seat] = "partner"
+        current = tuple(layout)
+        for _ in range(LiveBelotBot._rotations_needed(0, partner_seat)):
+            current = _rotate_once(current)
+        assert current[2] == "partner", f"from seat {partner_seat}"
+
+
+def test_a_table_that_will_not_come_right_is_left_alone(capsys):
+    """Two rotations always suffice. A third means the rule no longer holds,
+    and shuffling a table full of people on a broken assumption is worse than
+    stopping: every rotation ejects the other three players."""
+    bot = _bot()
+    bot.ROTATE_RETRY_S = 0.0
+    client = _feed(bot, _lobby(["a", "b", PARTNER, ME]), times=40)
+
+    assert client.rotations == LiveBelotBot.MAX_ROTATIONS == 3
+    assert client.readies == 0, "must not start a mis-seated match either"
+    out = capsys.readouterr().out
+    assert "not behaving as measured" in out
+
+
 # ------------------------------------------------------------------ logging
 def test_the_seat_layout_is_reported_by_role_not_by_name(capsys):
     """Which seats are ours is the whole question; the strangers at the table

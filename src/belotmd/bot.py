@@ -45,7 +45,11 @@ class LiveBelotBot:
     # other than what we think, this stops after six tries instead of
     # shuffling the table forever.
     ROTATE_RETRY_S = 3.0
-    MAX_ROTATIONS = 6
+    # Two rotations place any partner opposite (the three non-sender seats form
+    # a 3-cycle), so a third means the rule we measured did not hold and
+    # something about the table is not what we think. Stop and say so rather
+    # than shuffling a table full of people indefinitely.
+    MAX_ROTATIONS = 3
     # A probe rotation drops the other three players, who then rejoin, so the
     # experiment needs a wider gap than the ordinary fix-the-seats path.
     ROTATE_PROBE_GAP_S = 8.0
@@ -86,10 +90,13 @@ class LiveBelotBot:
         self.partner = (self.config.partner or "").strip().casefold() or None
         self.is_host = self.config.table_mode == "create"
         self.rotation_probe = int(getattr(self.config, "rotation_probe", 0) or 0)
-        if self.rotation_probe:
+        if self.rotation_probe and self.is_host:
             print(f"[Bot] ROTATION PROBE: will rotate the seats "
                   f"{self.rotation_probe}x before playing, whatever the "
                   f"layout, and log what moves.")
+        elif self.rotation_probe:
+            print("[Bot] Rotation probe ignored: only the table's creator can "
+                  "move players between seats.")
         if self.partner:
             print(f"[Bot] Paired run: holding READY until our partner sits "
                   f"opposite ({'host' if self.is_host else 'guest'}).")
@@ -156,6 +163,7 @@ class LiveBelotBot:
         self._seat_map = None         # last seat layout we reported
         self._probe_done = 0          # probe rotations sent at THIS table
         self._seat_labels = {}        # player id -> a letter, per table
+        self._rotation_gave_up = False
 
     def _check_room_change(self):
         """Notice that the client joined a different table and start clean."""
@@ -313,6 +321,21 @@ class LiveBelotBot:
             return False
         return self._partner_seat(raw_state) != (my_pos + 2) % 4
 
+    @staticmethod
+    def _rotations_needed(my_pos, partner_seat):
+        """How many rotations put our partner opposite us.
+
+        A rotation moves every seat but ours one place forward, so the three
+        other chairs are a 3-cycle and the answer is a subtraction rather than
+        something to search for. [CONFIRMED live: 1 when the partner sits next
+        to us on our left, 2 when on our right, 0 when already opposite.]
+        """
+        others = [(my_pos + k) % 4 for k in (1, 2, 3)]
+        if partner_seat not in others:
+            return 0
+        target = (my_pos + 2) % 4
+        return (others.index(target) - others.index(partner_seat)) % 3
+
     def _seat_layout(self, players, my_pos, partner_seat):
         """Who sits where, named so that MOVEMENT is visible but people are not.
 
@@ -381,18 +404,29 @@ class LiveBelotBot:
             await self.client.change_players_position()
             return
 
-        if seated < 4 or self._rotations >= self.MAX_ROTATIONS:
+        if seated < 4:
             # Nothing to rotate yet: an empty seat will be filled by whoever
             # sits down next, and that changes the arrangement anyway.
+            return
+        if self._rotations >= self.MAX_ROTATIONS:
+            if not self._rotation_gave_up:
+                self._rotation_gave_up = True
+                print(f"[Bot][WARN] {self._rotations} rotations and our partner "
+                      f"is still not opposite. Two should always be enough, so "
+                      f"the seat rule is not behaving as measured. Holding "
+                      f"READY rather than shuffling this table any further.")
             return
         if now - self._rotate_ts < self.ROTATE_RETRY_S:
             return
 
         self._rotate_ts = now
         self._rotations += 1
-        print(f"[Bot] rotating the other seats "
-              f"({self._rotations}/{self.MAX_ROTATIONS}) to put our partner "
-              f"opposite.")
+        # Every rotation ejects the other three players and makes them rejoin,
+        # and some humans simply do not come back -- so say how many are left
+        # and never send more than the arithmetic calls for.
+        needed = self._rotations_needed(my_pos, partner_seat)
+        print(f"[Bot] rotating the other seats ({self._rotations}/"
+              f"{self.MAX_ROTATIONS}); {needed} rotation(s) should do it.")
         await self.client.change_players_position()
 
     @staticmethod
