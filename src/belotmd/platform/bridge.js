@@ -8,6 +8,12 @@ import WebSocket, { WebSocketServer } from 'ws';
 // client, and the token lets the client prove it reached its OWN daemon.
 const BRIDGE_PORT = Number(process.argv[2]) || 8765;
 const BRIDGE_TOKEN = process.argv[3] || "";
+
+// Every HTTP call gets a deadline. Without one a stalled request hangs the
+// bridge forever with no error and no log line -- the bot simply stops, which
+// is indistinguishable from a quiet lobby. A timeout surfaces as an ERROR,
+// which Python already knows how to recover from.
+const HTTP_TIMEOUT_MS = 20_000;
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // AUDIT: `activeRoom` / `pingInterval` were MODULE globals, so (a) a second
@@ -129,15 +135,26 @@ async function connectToGame(cookieString, say, session, avoidLast = false,
             console.log(`[Bridge] Rejoining active game room: ${roomId}`);
         } else if (table && table.mode === "create") {
             console.log("[Bridge] Creating a table...");
+            // The site answers 302 -> gameplay_new.php and seats the creator,
+            // so we FOLLOW the redirect and land on the page we need anyway.
+            //
+            // AUDIT: this used `redirect: "manual"`. That returns an opaque
+            // response whose body is never read, and the next request on the
+            // same pooled connection then stalls -- no error, no timeout, no
+            // log line. The first live run hung here for minutes, having
+            // created nothing.
             const createRes = await fetch("https://belot.md/gameTables.php", {
-                method: "POST", headers, body: table.body, redirect: "manual" });
-            // The site answers 302 -> gameplay_new.php and seats the creator.
-            // `redirect: "manual"` makes that an opaque response rather than a
-            // followed redirect, so the page read below is the real proof.
+                method: "POST", headers, body: table.body, redirect: "follow",
+                signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+            const html = await createRes.text();      // always drain the body
             if (createRes.status >= 400) {
                 throw new Error(`Creating a table failed (HTTP ${createRes.status}).`);
             }
-            ({ wsUrl, roomId, playerToken, playerId } = await readTokens(headers));
+            ({ wsUrl, roomId, playerToken, playerId } = scrapeTokens(html));
+            if (!wsUrl || !roomId) {
+                // Landed somewhere other than the gameplay page; ask for it.
+                ({ wsUrl, roomId, playerToken, playerId } = await readTokens(headers));
+            }
             if (!wsUrl || !roomId) throw new Error("Created a table, but its tokens did not parse.");
             console.log(`[Bridge] Created a table; seated in room ${roomId}.`);
         } else if (table && table.mode === "join") {
@@ -180,7 +197,10 @@ async function connectToGame(cookieString, say, session, avoidLast = false,
         session.room = room;
 
         session.ping = setInterval(() => {
-            fetch("https://belot.md/api/game.php?ping", { headers }).catch(() => {});
+            fetch("https://belot.md/api/game.php?ping",
+                  { headers, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
+                .then(r => r.text())          // drain it; an unread body stalls the pool
+                .catch(() => {});
         }, 30_000);
 
         room.onStateChange((state) => say({ event: "STATE", data: state, myPlayerId: playerId }));
@@ -216,7 +236,8 @@ function buildHeaders(cookieString) {
 async function fetchLobby(cookieString) {
     const params = new URLSearchParams({ getMeseNew: "1", nrJucatori: "4", minStatus: "0" });
     const res = await fetch("https://belot.md/gameTables.php",
-                            { method: "POST", headers: buildHeaders(cookieString), body: params });
+                            { method: "POST", headers: buildHeaders(cookieString), body: params,
+                              signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
     const data = await res.json();
     return data.mese || [];
 }
@@ -225,8 +246,12 @@ async function fetchLobby(cookieString) {
 // gameplay page. Reaching this page is also what proves a create or a seat
 // reservation actually worked.
 async function readTokens(headers) {
-    const res = await fetch("https://belot.md/gameplay_new.php", { headers });
-    const html = await res.text();
+    const res = await fetch("https://belot.md/gameplay_new.php",
+                            { headers, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+    return scrapeTokens(await res.text());
+}
+
+function scrapeTokens(html) {
     return {
         wsUrl: html.match(/wsUrl:\s*"([^"]+)"/)?.[1],
         roomId: html.match(/roomId:\s*"([^"]+)"/)?.[1],
@@ -239,7 +264,8 @@ async function reserveSeat(headers, gameId, password) {
     console.log(`[Bridge] Reserving seat at table ${gameId}...`);
     const params = new URLSearchParams({ enterGame: "4", gameId, password: password || "" });
     const res = await fetch("https://belot.md/gameTables.php",
-                            { method: "POST", headers, body: params });
+                            { method: "POST", headers, body: params,
+                              signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
     const data = await res.json();
     if (data.success !== "gameplay_new.php") {
         const err = new Error(`Seat reservation failed at table ${gameId}.`);
