@@ -45,6 +45,9 @@ class LiveBelotBot:
             reconnect=self.config.reconnect,
             retry_delay_s=self.config.retry_delay_s,
             rejoin_delay_s=self.config.rejoin_delay_s,
+            table_mode=self.config.table_mode,
+            table_id=self.config.table_id or None,
+            table_creator=self.config.table_creator or None,
         )
         self.sync_engine = StateSynchronizer()
 

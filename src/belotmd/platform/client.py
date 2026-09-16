@@ -23,12 +23,14 @@ from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
                        LEAVE_KICKED, LEAVE_POSITION_CHANGED, NOT_STARTED,
                        RECOVER_LATER, RECOVER_NOW, RECOVER_SOON, RECOVER_STOP,
                        SUIT_TO_INT, leave_recovery, match_underway)
+from .tables import CREATE_TABLE_BODY, find_table, is_joinable, table_id_of
 
 
 class BelotClient:
     def __init__(self, cookies: str, bridge_port: int = 0,
                  reconnect: bool = True, retry_delay_s: float = 300.0,
-                 rejoin_delay_s: float = 5.0):
+                 rejoin_delay_s: float = 5.0, table_mode: str = "lobby",
+                 table_id: str = None, table_creator: str = None):
         """`reconnect` keeps the bot looking for tables instead of exiting.
 
         Two delays, because two very different situations end a session:
@@ -48,6 +50,12 @@ class BelotClient:
         self.cookies = cookies
         self.bridge_port = bridge_port
         self.bridge_token = secrets.token_hex(16)
+        # Which table to sit at. "lobby" is the historic behaviour (the first
+        # open public table). A pair uses the other two: the host "create"s a
+        # table and the guest "join"s the one that host made.
+        self.table_mode = table_mode
+        self.table_id = table_id
+        self.table_creator = table_creator
         self.reconnect = reconnect
         self.retry_delay_s = float(retry_delay_s)
         self.rejoin_delay_s = float(rejoin_delay_s)
@@ -205,6 +213,28 @@ class BelotClient:
                     await self._queue.put(("MESSAGE", (msg.get("type"),
                                                        msg.get("data"))))
 
+                elif event == "LOBBY":
+                    # "join" mode, step two: the lobby came back, so pick our
+                    # partner's table out of it.
+                    wanted = find_table(msg.get("mese"),
+                                        table_id=self.table_id,
+                                        creator=self.table_creator)
+                    who = self.table_creator or self.table_id
+                    if wanted is None:
+                        if not await self._recover(
+                                ws, RECOVER_SOON,
+                                f"{who}'s table is not in the lobby yet"):
+                            break
+                    elif not is_joinable(wanted):
+                        if not await self._recover(
+                                ws, RECOVER_SOON,
+                                f"{who}'s table has no free seat"):
+                            break
+                    else:
+                        found = table_id_of(wanted)
+                        print(f"[SDK] Found {who}'s table {found}; taking a seat.")
+                        await self._request_table(ws, table_id=found)
+
                 elif event == "ERROR":
                     detail = msg.get("message") or msg.get("code")
                     print(f"[SDK Error]: {detail}")
@@ -213,8 +243,13 @@ class BelotClient:
                     # available." Without this the bot sat idle forever
                     # waiting for frames from a room it never entered.
                     if not self._in_room:
-                        if not await self._recover(ws, RECOVER_LATER,
-                                                   f"could not join a table ({detail})"):
+                        # Our partner's table not being listed yet is a matter
+                        # of seconds, not of the five-minute "the lobby is
+                        # empty" wait.
+                        soon = msg.get("code") == "TABLE_NOT_FOUND"
+                        if not await self._recover(
+                                ws, RECOVER_SOON if soon else RECOVER_LATER,
+                                f"could not join a table ({detail})"):
                             break
 
                 elif event == "LEAVE":
@@ -253,18 +288,32 @@ class BelotClient:
             await self._queue.put((None, None))     # drain sentinel
             await consumer
 
-    async def _request_table(self, ws, avoid_last=False):
+    async def _request_table(self, ws, avoid_last=False, table_id=None):
         """Ask the bridge to find a table and join it.
 
         `avoid_last` tells it to skip the table it most recently reserved --
         the one that just removed us. Without that the lobby pick, which takes
         the first open table, would very likely hand us straight back to it.
+
+        In "join" mode this takes two steps: ask for the lobby, pick our
+        partner's table HERE (in Python, where the rule is tested), and come
+        back with its id. The bridge never decides which table is ours.
         """
         self._in_room = False
         self._phase = NOT_STARTED
-        await ws.send(json.dumps({"action": "CONNECT",
-                                  "cookies": self.cookies,
-                                  "avoidLast": bool(avoid_last)}))
+
+        if self.table_mode == "join" and table_id is None:
+            await ws.send(json.dumps({"action": "LOBBY",
+                                      "cookies": self.cookies}))
+            return
+
+        request = {"action": "CONNECT", "cookies": self.cookies,
+                   "avoidLast": bool(avoid_last)}
+        if self.table_mode == "create":
+            request["table"] = {"mode": "create", "body": CREATE_TABLE_BODY}
+        elif self.table_mode == "join":
+            request["table"] = {"mode": "join", "tableId": table_id}
+        await ws.send(json.dumps(request))
 
     async def _recover(self, ws, action, reason, avoid_last=False):
         """Act on a recovery decision. -> True to keep the session alive."""

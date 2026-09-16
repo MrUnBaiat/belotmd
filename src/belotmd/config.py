@@ -96,6 +96,15 @@ class Config:
     agent: str = "random"
     checkpoint: str = ""
 
+    # --- which table ---
+    # "lobby" joins the first open public table, which is right for one bot
+    # and useless for a pair. Two of our accounts meet by having the host
+    # "create" a table and the guest "join" the one that host made -- found in
+    # the lobby by the host's username, so the two processes never talk.
+    table_mode: str = "lobby"
+    table_id: str = ""
+    table_creator: str = ""
+
     # --- staying on a table ---
     # Keep looking for tables instead of exiting after one session. A match
     # ending dissolves the table (TABLE_REMOVED), so without this the bot
@@ -150,6 +159,9 @@ class Config:
             auto_swap_seven=_flag(lookup, "BELOT_AUTO_SWAP_SEVEN", True),
             agent=lookup.get("BELOT_AGENT", "random"),
             checkpoint=lookup.get("BELOT_CHECKPOINT", ""),
+            table_mode=lookup.get("BELOT_TABLE_MODE", "lobby"),
+            table_id=lookup.get("BELOT_TABLE_ID", ""),
+            table_creator=lookup.get("BELOT_TABLE_CREATOR", ""),
             reconnect=_flag(lookup, "BELOT_RECONNECT", True),
             retry_delay_s=float(lookup.get("BELOT_RETRY_DELAY", 300)),
             rejoin_delay_s=float(lookup.get("BELOT_REJOIN_DELAY", 5)),

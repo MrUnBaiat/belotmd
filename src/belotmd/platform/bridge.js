@@ -77,7 +77,12 @@ wss.on('connection', (pySocket) => {
                     dropRoom();
                 }
                 await connectToGame(cmd.cookies, say, session,
-                                    cmd.avoidLast === true);
+                                    cmd.avoidLast === true, cmd.table || null);
+            } else if (cmd.action === "LOBBY") {
+                // WHICH table is ours is decided in Python, where the rule is
+                // unit-tested and where the partner's name is configured. The
+                // bridge only fetches the list.
+                say({ event: "LOBBY", mese: await fetchLobby(cmd.cookies) });
             } else if (cmd.action === "SEND") {
                 if (!session.room) { say({ event: "ERROR", message: "SEND with no active room" }); return; }
                 session.room.send(cmd.type, cmd.payload);
@@ -101,13 +106,9 @@ wss.on('connection', (pySocket) => {
     pySocket.on('error', (e) => cleanup(`python socket error: ${e.message}`));
 });
 
-async function connectToGame(cookieString, say, session, avoidLast = false) {
-    const headers = {
-        'Cookie': cookieString,
-        'User-Agent': USER_AGENT,
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': 'https://belot.md/'
-    };
+async function connectToGame(cookieString, say, session, avoidLast = false,
+                             table = null) {
+    const headers = buildHeaders(cookieString);
 
     // AUDIT: a `global.WebSocket = CustomWebSocket` used to sit here, carrying
     // this connection's cookie into every later Colyseus connect -- a
@@ -118,19 +119,33 @@ async function connectToGame(cookieString, say, session, avoidLast = false) {
     // below are for the PHP calls.
 
     try {
-        let wsUrl, roomId, playerToken, playerId;
-
         console.log("[Bridge] Checking for an ongoing active game...");
-        let pageRes = await fetch("https://belot.md/gameplay_new.php", { headers });
-        let html = await pageRes.text();
-
-        wsUrl = html.match(/wsUrl:\s*"([^"]+)"/)?.[1];
-        roomId = html.match(/roomId:\s*"([^"]+)"/)?.[1];
-        playerToken = html.match(/playerToken:\s*"([^"]+)"/)?.[1];
-        playerId = html.match(/playerId:\s*"([^"]+)"/)?.[1];
+        let { wsUrl, roomId, playerToken, playerId } = await readTokens(headers);
 
         if (wsUrl && roomId) {
+            // This branch is also how the host gets back to the table it
+            // created: belot.md refuses to create a table for an account that
+            // is already seated, so rejoining must be tried FIRST.
             console.log(`[Bridge] Rejoining active game room: ${roomId}`);
+        } else if (table && table.mode === "create") {
+            console.log("[Bridge] Creating a table...");
+            const createRes = await fetch("https://belot.md/gameTables.php", {
+                method: "POST", headers, body: table.body, redirect: "manual" });
+            // The site answers 302 -> gameplay_new.php and seats the creator.
+            // `redirect: "manual"` makes that an opaque response rather than a
+            // followed redirect, so the page read below is the real proof.
+            if (createRes.status >= 400) {
+                throw new Error(`Creating a table failed (HTTP ${createRes.status}).`);
+            }
+            ({ wsUrl, roomId, playerToken, playerId } = await readTokens(headers));
+            if (!wsUrl || !roomId) throw new Error("Created a table, but its tokens did not parse.");
+            console.log(`[Bridge] Created a table; seated in room ${roomId}.`);
+        } else if (table && table.mode === "join") {
+            console.log(`[Bridge] Joining table ${table.tableId}...`);
+            session.lastTableId = table.tableId;
+            await reserveSeat(headers, table.tableId, table.password || "");
+            ({ wsUrl, roomId, playerToken, playerId } = await readTokens(headers));
+            if (!wsUrl || !roomId) throw new Error("Failed to parse Colyseus tokens from gameplay page.");
         } else {
             console.log("[Bridge] No active game. Searching public tables...");
             const lobbyParams = new URLSearchParams({ getMeseNew: "1", nrJucatori: "4", minStatus: "0" });
@@ -150,20 +165,8 @@ async function connectToGame(cookieString, say, session, avoidLast = false) {
             if (!openTable) throw new Error("No public open tables available.");
 
             session.lastTableId = openTable.id;
-            console.log(`[Bridge] Reserving seat at table ${openTable.id}...`);
-            const joinParams = new URLSearchParams({ enterGame: "4", gameId: openTable.id, password: "" });
-            const joinRes = await fetch("https://belot.md/gameTables.php", { method: "POST", headers, body: joinParams });
-            const joinData = await joinRes.json();
-            if (joinData.success !== "gameplay_new.php") throw new Error("Seat reservation failed.");
-
-            pageRes = await fetch("https://belot.md/gameplay_new.php", { headers });
-            html = await pageRes.text();
-
-            wsUrl = html.match(/wsUrl:\s*"([^"]+)"/)?.[1];
-            roomId = html.match(/roomId:\s*"([^"]+)"/)?.[1];
-            playerToken = html.match(/playerToken:\s*"([^"]+)"/)?.[1];
-            playerId = html.match(/playerId:\s*"([^"]+)"/)?.[1];
-
+            await reserveSeat(headers, openTable.id, "");
+            ({ wsUrl, roomId, playerToken, playerId } = await readTokens(headers));
             if (!wsUrl || !roomId) throw new Error("Failed to parse Colyseus tokens from gameplay page.");
         }
 
@@ -195,6 +198,52 @@ async function connectToGame(cookieString, say, session, avoidLast = false) {
         // AUDIT: on a partial failure the room may already be joined.
         if (session.ping) { clearInterval(session.ping); session.ping = null; }
         if (session.room) { try { session.room.leave(); } catch (_) {} session.room = null; }
-        say({ event: "ERROR", message: err.message });
+        // `code` lets Python tell "our partner's table is not listed yet"
+        // (seconds away) from "the lobby is empty" (a five-minute wait).
+        say({ event: "ERROR", code: err.code, message: err.message });
+    }
+}
+
+function buildHeaders(cookieString) {
+    return {
+        'Cookie': cookieString,
+        'User-Agent': USER_AGENT,
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://belot.md/'
+    };
+}
+
+async function fetchLobby(cookieString) {
+    const params = new URLSearchParams({ getMeseNew: "1", nrJucatori: "4", minStatus: "0" });
+    const res = await fetch("https://belot.md/gameTables.php",
+                            { method: "POST", headers: buildHeaders(cookieString), body: params });
+    const data = await res.json();
+    return data.mese || [];
+}
+
+// The four values every join needs, scraped from `window.customData` on the
+// gameplay page. Reaching this page is also what proves a create or a seat
+// reservation actually worked.
+async function readTokens(headers) {
+    const res = await fetch("https://belot.md/gameplay_new.php", { headers });
+    const html = await res.text();
+    return {
+        wsUrl: html.match(/wsUrl:\s*"([^"]+)"/)?.[1],
+        roomId: html.match(/roomId:\s*"([^"]+)"/)?.[1],
+        playerToken: html.match(/playerToken:\s*"([^"]+)"/)?.[1],
+        playerId: html.match(/playerId:\s*"([^"]+)"/)?.[1],
+    };
+}
+
+async function reserveSeat(headers, gameId, password) {
+    console.log(`[Bridge] Reserving seat at table ${gameId}...`);
+    const params = new URLSearchParams({ enterGame: "4", gameId, password: password || "" });
+    const res = await fetch("https://belot.md/gameTables.php",
+                            { method: "POST", headers, body: params });
+    const data = await res.json();
+    if (data.success !== "gameplay_new.php") {
+        const err = new Error(`Seat reservation failed at table ${gameId}.`);
+        err.code = "TABLE_NOT_FOUND";      // gone, full, or never existed
+        throw err;
     }
 }
