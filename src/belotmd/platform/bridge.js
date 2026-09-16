@@ -1,16 +1,44 @@
 import { Client } from 'colyseus.js';
 import WebSocket, { WebSocketServer } from 'ws';
 
-const BRIDGE_PORT = 8765;
+// AUDIT: the port was hardcoded at 8765, which made two accounts on one
+// machine unsafe: the second daemon could not bind, and its Python client then
+// connected to the FIRST one's bridge -- receiving another account's STATE
+// frames, hand included. Port and token now come from argv, one bridge per
+// client, and the token lets the client prove it reached its OWN daemon.
+const BRIDGE_PORT = Number(process.argv[2]) || 8765;
+const BRIDGE_TOKEN = process.argv[3] || "";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 // AUDIT: `activeRoom` / `pingInterval` were MODULE globals, so (a) a second
 // Python client silently hijacked the first one's room and (b) neither was
 // cleared on leave, so post-leave SENDs vanished into a dead room object.
 const wss = new WebSocketServer({ port: BRIDGE_PORT });
+
+// Without this a bind failure (port taken) is an unhandled 'error' event: the
+// daemon dies with a stack trace that says nothing about the cause, and the
+// Python side reports it as a timeout.
+wss.on('error', (err) => {
+    console.error(`[Bridge] Cannot listen on 127.0.0.1:${BRIDGE_PORT}: ${err.message}`);
+    process.exit(1);
+});
 console.log(`[Bridge] Daemon listening on ws://127.0.0.1:${BRIDGE_PORT}`);
 
+// One Python agent per daemon. Sharing a bridge is exactly the accident this
+// file now exists to prevent, so a second attach is refused rather than served.
+let attached = false;
+
 wss.on('connection', (pySocket) => {
+    if (attached) {
+        console.warn("[Bridge] A second Python agent tried to attach -- refusing.");
+        try {
+            pySocket.send(JSON.stringify({ event: "ERROR",
+                                           message: "this bridge already has a Python agent" }));
+        } catch (_) {}
+        pySocket.close();
+        return;
+    }
+    attached = true;
     console.log("[Bridge] Python Agent connected.");
 
     // `lastTableId` lets Python say "anywhere but there" after a kick:
@@ -28,6 +56,11 @@ wss.on('connection', (pySocket) => {
         try { pySocket.send(JSON.stringify(obj)); }
         catch (err) { console.error("[Bridge] send failed:", err.message); }
     };
+
+    // Always the first frame: the client checks this token before it sends a
+    // single cookie, so it can tell its own daemon from one that happens to be
+    // listening on the same port.
+    say({ event: "HELLO", token: BRIDGE_TOKEN });
 
     const dropRoom = () => {
         if (session.ping) { clearInterval(session.ping); session.ping = null; }
@@ -58,6 +91,7 @@ wss.on('connection', (pySocket) => {
     });
 
     const cleanup = (why) => {
+        attached = false;          // a restarted client may attach again
         if (session.closed) return;
         session.closed = true;
         console.log(`[Bridge] Cleaning up session (${why}).`);
@@ -75,12 +109,13 @@ async function connectToGame(cookieString, say, session, avoidLast = false) {
         'Referer': 'https://belot.md/'
     };
 
-    class CustomWebSocket extends WebSocket {
-        constructor(url, protocols) {
-            super(url, protocols, { headers: { 'Origin': 'https://belot.md', 'User-Agent': USER_AGENT, 'Cookie': cookieString } });
-        }
-    }
-    global.WebSocket = CustomWebSocket;
+    // AUDIT: a `global.WebSocket = CustomWebSocket` used to sit here, carrying
+    // this connection's cookie into every later Colyseus connect -- a
+    // cross-account hazard with nothing to gain. It never did anything either:
+    // colyseus.js binds `globalThis.WebSocket || NodeWebSocket` ONCE at import
+    // (transport/WebSocketTransport.mjs:4), long before this runs. The room
+    // handshake authenticates with `playerToken`, not with cookies; the cookies
+    // below are for the PHP calls.
 
     try {
         let wsUrl, roomId, playerToken, playerId;

@@ -433,13 +433,39 @@ class StateSynchronizer:
         if not players:
             return None
 
-        # 1. Identity
+        # 1. Identity, and does this frame even belong to us?
+        #
+        # Two accounts now run side by side at the SAME table, so "whose frame
+        # is this" stops being rhetorical. All three refusals below were silent
+        # before, and the third one actively wrote another player's hand into
+        # our state (section 6 stores `cards` from ANY seat) and then called the
+        # agent with it.
+        if not my_player_id:
+            print("[Sync][VIOLATION] frame refused: no identity was supplied, "
+                  "so `None == None` would match a seat at random.")
+            return None
+
         self.my_pos = None
         for idx, p in enumerate(players):
             if p.get("id") == my_player_id or p.get("sessionId") == my_player_id:
                 self.my_pos = idx
                 break
         if self.my_pos is None:
+            print(f"[Sync][VIOLATION] frame refused: we are not at this table "
+                  f"({len(players)} seats, none of them ours).")
+            return None
+
+        # The server sends `cards` for the receiving player only; every other
+        # seat gets `numCards`. A frame that breaks that is one we were never
+        # meant to see -- in practice another bot's frame delivered to us.
+        stray = [i for i, p in enumerate(players)
+                 if i != self.my_pos and (p.get("cards") or "")]
+        if stray:
+            print(f"[Sync][VIOLATION] frame refused: seats {stray} carry a "
+                  f"hand and we are seat {self.my_pos}. This frame belongs to "
+                  f"another player; applying it would put their cards in our "
+                  f"state.")
+            self.my_pos = None
             return None
 
         phase = raw_state.get("currentPhase", 0)

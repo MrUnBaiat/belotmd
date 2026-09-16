@@ -9,9 +9,15 @@ to the callbacks in arrival order.
 import asyncio
 import json
 import os
+import secrets
+import socket
 import subprocess
 import time
 import websockets
+# Imported by name: `websockets.exceptions` is a lazy attribute in current
+# versions, so touching it inside an `except` clause raises AttributeError
+# WHILE handling the original error, and the real failure is lost.
+from websockets.exceptions import WebSocketException
 
 from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
                        LEAVE_KICKED, LEAVE_POSITION_CHANGED, NOT_STARTED,
@@ -20,7 +26,7 @@ from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
 
 
 class BelotClient:
-    def __init__(self, cookies: str, bridge_port: int = 8765,
+    def __init__(self, cookies: str, bridge_port: int = 0,
                  reconnect: bool = True, retry_delay_s: float = 300.0,
                  rejoin_delay_s: float = 5.0):
         """`reconnect` keeps the bot looking for tables instead of exiting.
@@ -31,9 +37,17 @@ class BelotClient:
           retry_delay_s   there is nothing to join (no open tables, or we were
                           kicked). Waiting is the only useful move, and
                           hammering the lobby every few seconds is rude.
+
+        `bridge_port` 0 means "pick a free one", which is what makes two
+        accounts on one machine safe. With the old fixed 8765 the second
+        client's daemon could not bind, and the client then connected to the
+        FIRST client's bridge -- and was handed another account's frames, hand
+        included. The token below closes the remaining gap: a stale or foreign
+        daemon on the port we picked is detected before we send any cookie.
         """
         self.cookies = cookies
         self.bridge_port = bridge_port
+        self.bridge_token = secrets.token_hex(16)
         self.reconnect = reconnect
         self.retry_delay_s = float(retry_delay_s)
         self.rejoin_delay_s = float(rejoin_delay_s)
@@ -47,17 +61,33 @@ class BelotClient:
         self._phase = NOT_STARTED
         self._in_room = False
 
-    # How long to wait for `node bridge.js` to bind BRIDGE_PORT.
+    # How long to wait for `node bridge.js` to bind its port.
     DAEMON_TIMEOUT_S = 15.0
     DAEMON_POLL_S = 0.25
+    # How long to wait for that daemon to identify itself.
+    HELLO_TIMEOUT_S = 5.0
+
+    @staticmethod
+    def _free_port():
+        """Ask the OS for a free port. Racy in principle -- another process
+        could take it between here and the daemon's bind -- but the daemon then
+        exits with a clear message and the token check makes the silent
+        wrong-bridge outcome impossible."""
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
 
     def _start_node_daemon(self):
-        print("[SDK] Launching background Node.js bridge...")
+        if not self.bridge_port:
+            self.bridge_port = self._free_port()
+        print(f"[SDK] Launching background Node.js bridge on port "
+              f"{self.bridge_port}...")
         bridge_path = os.path.join(os.path.dirname(__file__), "bridge.js")
         if not os.path.exists(bridge_path):
             raise FileNotFoundError(f"bridge.js not found at {bridge_path}")
         try:
-            self.node_process = subprocess.Popen(["node", bridge_path])
+            self.node_process = subprocess.Popen(
+                ["node", bridge_path, str(self.bridge_port), self.bridge_token])
         except FileNotFoundError:
             raise RuntimeError(
                 "`node` is not on PATH -- the bridge daemon cannot start."
@@ -86,16 +116,44 @@ class BelotClient:
                 )
             try:
                 ws = await websockets.connect(uri)
+                await self._verify_bridge(ws)
                 if attempt > 1:
                     print(f"[SDK] Bridge daemon ready after {attempt} attempts.")
                 return ws
-            except (OSError, websockets.exceptions.WebSocketException) as exc:
+            except (OSError, WebSocketException) as exc:
                 if time.monotonic() >= deadline:
                     raise RuntimeError(
                         f"bridge daemon did not accept a connection on "
                         f"{uri} within {self.DAEMON_TIMEOUT_S}s ({exc})"
                     ) from exc
                 await asyncio.sleep(self.DAEMON_POLL_S)
+
+    async def _verify_bridge(self, ws):
+        """The daemon's first frame must be OUR token.
+
+        Anything else means we are talking to someone else's bridge -- another
+        account's, or a stale one left on this port -- and continuing would
+        send this account's cookies down it and accept that account's frames as
+        ours. Refuse before a single cookie leaves the process.
+        """
+        try:
+            raw = await asyncio.wait_for(ws.recv(), self.HELLO_TIMEOUT_S)
+            hello = json.loads(raw)
+        except (asyncio.TimeoutError, ValueError, WebSocketException) as exc:
+            await ws.close()
+            raise RuntimeError(
+                f"the daemon on port {self.bridge_port} did not identify "
+                f"itself ({type(exc).__name__}). Another program, or an old "
+                f"bridge.js, is listening there."
+            ) from exc
+
+        if hello.get("event") != "HELLO" or hello.get("token") != self.bridge_token:
+            await ws.close()
+            raise RuntimeError(
+                f"the daemon on port {self.bridge_port} is not ours (first "
+                f"frame was {hello!r}). Refusing to hand it this account's "
+                f"cookies."
+            )
 
     async def connect(self, on_state_callback, on_message_callback=None):
         self._start_node_daemon()
