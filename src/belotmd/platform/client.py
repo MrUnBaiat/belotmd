@@ -247,10 +247,15 @@ class BelotClient:
                     # available." Without this the bot sat idle forever
                     # waiting for frames from a room it never entered.
                     if not self._in_room:
-                        # Our partner's table not being listed yet is a matter
-                        # of seconds, not of the five-minute "the lobby is
-                        # empty" wait.
-                        soon = msg.get("code") == "TABLE_NOT_FOUND"
+                        # The long wait exists for "the lobby is empty", and
+                        # neither case here is that. Our partner's table not
+                        # being listed yet is a matter of seconds -- and in
+                        # join mode EVERY failure is, because the table we want
+                        # is being created, filled and deleted on that
+                        # timescale. Waiting 300s there once left the guest
+                        # asleep while the host churned through five tables.
+                        soon = (msg.get("code") == "TABLE_NOT_FOUND"
+                                or self.table_mode == "join")
                         if not await self._recover(
                                 ws, RECOVER_SOON if soon else RECOVER_LATER,
                                 f"could not join a table ({detail})"):

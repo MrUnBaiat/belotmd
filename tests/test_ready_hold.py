@@ -316,6 +316,21 @@ def test_the_leave_probe_abandons_the_first_table_once_our_partner_sits():
     assert client.readies == 0, "no point announcing ourselves on the way out"
 
 
+def test_the_layout_is_logged_before_we_act_on_it(capsys):
+    """THE BUG, seen live: the probe and the abandon rules returned before the
+    seats were printed, so the log showed a table with no partner in it and
+    then a deletion whose stated reason only makes sense if the partner was
+    there. Whatever we act on has to be on the record first."""
+    _feed(_bot(leave_probe=1), _lobby([None, PARTNER, None, ME]))
+    out = capsys.readouterr().out
+
+    seats = [line for line in out.splitlines() if "seats " in line]
+    assert seats, "acted on a layout that was never logged"
+    assert "1=partner" in seats[-1], "and it must show the partner we acted on"
+    assert out.index(seats[-1]) < out.index("LEAVE PROBE 1/1"), (
+        "the layout must be logged BEFORE the decision taken on it")
+
+
 def test_the_leave_probe_ejects_nobody():
     """It must fire while only the two of us are seated."""
     bot = _bot(leave_probe=1)

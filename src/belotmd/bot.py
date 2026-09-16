@@ -411,6 +411,12 @@ class LiveBelotBot:
         partner_seat = self._partner_seat(raw_state)
         now = time.monotonic()
 
+        # Logged BEFORE anything is decided on it. The probe and the abandon
+        # rules used to run first and return, so the layout they acted on was
+        # never printed: the log showed a table without our partner, then a
+        # deletion for a reason that only makes sense if the partner was there.
+        self._log_seats(players, my_pos, partner_seat)
+
         # Armed the FIRST time this table fills, and never re-armed. Restarting
         # it whenever somebody leaves and is replaced is precisely how a table
         # that churns one seat could keep us waiting for ever.
@@ -447,6 +453,16 @@ class LiveBelotBot:
             await self._fix_seats(raw_state, my_pos)
             return True
         return False
+
+    def _log_seats(self, players, my_pos, partner_seat):
+        """Report the layout whenever it changes. -> the layout."""
+        layout = self._seat_layout(players, my_pos, partner_seat)
+        if layout != self._seat_map:
+            self._seat_map = layout
+            where = " ".join(f"{s}={r}" for s, r in enumerate(layout))
+            print(f"[Bot] seats {where} -- our partner belongs at seat "
+                  f"{(my_pos + 2) % 4}.")
+        return layout
 
     def _seat_layout(self, players, my_pos, partner_seat):
         """Who sits where, named so that MOVEMENT is visible but people are not.
@@ -491,13 +507,6 @@ class LiveBelotBot:
         partner_seat = self._partner_seat(raw_state)
         seated = sum(1 for p in players if p.get("id"))
 
-        layout = self._seat_layout(players, my_pos, partner_seat)
-        if layout != self._seat_map:
-            self._seat_map = layout
-            where = " ".join(f"{s}={r}" for s, r in enumerate(layout))
-            print(f"[Bot] seats {where} -- holding READY (our partner belongs "
-                  f"at seat {(my_pos + 2) % 4}).")
-
         now = time.monotonic()
         if not self.is_host:
             return                      # the guest can only wait
@@ -508,7 +517,7 @@ class LiveBelotBot:
                 return
             self._rotate_ts = now
             self._probe_done += 1
-            where = " ".join(f"{s}={r}" for s, r in enumerate(layout))
+            where = " ".join(f"{s}={r}" for s, r in enumerate(self._seat_map or ()))
             print(f"[Bot][PROBE] rotation {self._probe_done}/"
                   f"{self.rotation_probe} sent, from {where} -- the next "
                   f"'seats' line is what it did.")

@@ -169,7 +169,15 @@ async function connectToGame(cookieString, say, session, avoidLast = false,
             session.lastTableId = table.tableId;
             await reserveSeat(headers, table.tableId, table.password || "");
             ({ wsUrl, roomId, playerToken, playerId } = await readTokens(headers));
-            if (!wsUrl || !roomId) throw new Error("Failed to parse Colyseus tokens from gameplay page.");
+            if (!wsUrl || !roomId) {
+                // The seat was reserved and the page still has no room on it:
+                // the table was deleted underneath us between the two calls.
+                // That is a vanished table, not a broken one -- say so, or the
+                // client treats it as "nothing to join" and waits minutes.
+                const err = new Error(`Table ${table.tableId} vanished while we were sitting down.`);
+                err.code = "TABLE_NOT_FOUND";
+                throw err;
+            }
         } else {
             console.log("[Bridge] No active game. Searching public tables...");
             const lobbyParams = new URLSearchParams({ getMeseNew: "1", nrJucatori: "4", minStatus: "0" });
@@ -191,7 +199,11 @@ async function connectToGame(cookieString, say, session, avoidLast = false,
             session.lastTableId = openTable.id;
             await reserveSeat(headers, openTable.id, "");
             ({ wsUrl, roomId, playerToken, playerId } = await readTokens(headers));
-            if (!wsUrl || !roomId) throw new Error("Failed to parse Colyseus tokens from gameplay page.");
+            if (!wsUrl || !roomId) {
+                const err = new Error(`Table ${openTable.id} vanished while we were sitting down.`);
+                err.code = "TABLE_NOT_FOUND";
+                throw err;
+            }
         }
 
         console.log(`[Bridge] Connecting Colyseus client to ${wsUrl}...`);

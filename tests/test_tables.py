@@ -202,6 +202,42 @@ def test_the_guest_waits_and_asks_again_while_the_table_is_missing():
     assert bridge.of("CONNECT")[0]["table"]["tableId"] == "new-44709391"
 
 
+def test_a_guest_never_falls_into_the_long_wait():
+    """THE BUG, seen live: the host deleted a table while the guest was
+    sitting down, so the guest's join failed with an error carrying no code --
+    and slept for 300s. The host meanwhile churned through five tables looking
+    for a partner that was unconscious. In join mode the table we want is
+    created, filled and deleted on a timescale of seconds; nothing here
+    deserves the five-minute wait."""
+    bridge, slept = _drive(
+        [{"event": "ERROR",
+          "message": "Table new-1 vanished while we were sitting down."}],
+        table_mode="join", table_creator=HOST,
+        rejoin_delay_s=5, retry_delay_s=300)
+
+    assert slept == [5]
+
+
+def test_a_vanished_table_is_told_apart_from_an_empty_lobby():
+    """The bridge now labels it, so even the lobby pick retries promptly."""
+    bridge, slept = _drive(
+        [{"event": "ERROR", "code": "TABLE_NOT_FOUND",
+          "message": "Table new-1 vanished while we were sitting down."}],
+        rejoin_delay_s=5, retry_delay_s=300)
+
+    assert slept == [5]
+
+
+def test_an_empty_lobby_still_waits():
+    """The long wait is for exactly one thing -- there is nothing to join --
+    and a single-agent run must keep behaving that way."""
+    bridge, slept = _drive(
+        [{"event": "ERROR", "message": "No public open tables available."}],
+        rejoin_delay_s=5, retry_delay_s=300)
+
+    assert slept == [300]
+
+
 def test_the_guest_does_not_squeeze_into_a_full_table():
     bridge, _ = _drive([{"event": "LOBBY", "mese": [FULL]}],
                        table_mode="join", table_id="new-44711111")
