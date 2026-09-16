@@ -390,6 +390,21 @@ class BelotClient:
         SHOW_COMBINATION {"who": seat, "value": "<code>"} in response."""
         await self._send("SHOW_COMBINATION", value)
 
+    async def change_players_position(self):
+        """Ask the table to move the other players around.
+
+        [UNVERIFIED] Captured from the web client, where it carries no payload
+        we have been able to decode, and the reply is Colyseus-encoded state.
+        Observed effect: the other three seats rotate while the sender stays
+        put, so at most two sends put a chosen partner opposite. Read the
+        result from the next STATE frame, never from the reply.
+
+        Only the table's creator appears to be able to do this. The other
+        players are dropped with close code 4005 (POSITION_CHANGED) and rejoin
+        immediately, which the recovery policy already handles.
+        """
+        await self._send("CHANGE_PLAYERS_POSITION", {})
+
     async def cut_deck(self, cut_index: int = 15):
         await self._send("PUSH_CARD", {"cardPushed": cut_index})
 

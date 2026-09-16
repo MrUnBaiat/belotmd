@@ -105,6 +105,12 @@ class Config:
     table_id: str = ""
     table_creator: str = ""
 
+    # Our other account's username. Setting it means "we are playing as a
+    # pair": the bot then withholds READY until that account is sitting
+    # OPPOSITE us, because the match starts the moment all four players are
+    # ready and a pair on opposite teams is the one outcome worth avoiding.
+    partner: str = ""
+
     # --- staying on a table ---
     # Keep looking for tables instead of exiting after one session. A match
     # ending dissolves the table (TABLE_REMOVED), so without this the bot
@@ -162,6 +168,7 @@ class Config:
             table_mode=lookup.get("BELOT_TABLE_MODE", "lobby"),
             table_id=lookup.get("BELOT_TABLE_ID", ""),
             table_creator=lookup.get("BELOT_TABLE_CREATOR", ""),
+            partner=lookup.get("BELOT_PARTNER", ""),
             reconnect=_flag(lookup, "BELOT_RECONNECT", True),
             retry_delay_s=float(lookup.get("BELOT_RETRY_DELAY", 300)),
             rejoin_delay_s=float(lookup.get("BELOT_REJOIN_DELAY", 5)),

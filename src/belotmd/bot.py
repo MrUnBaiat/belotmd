@@ -38,6 +38,21 @@ class LiveBelotBot:
     # acknowledged the first.
     READY_RESEND_S = 1.0
 
+    # Seat rotation, when playing as a pair. A rotation drops the other three
+    # players (close code 4005) and they rejoin, so it needs a gap; and since
+    # three other seats cycle, two sends are enough to reach any arrangement.
+    # The cap exists because the payload is unverified: if it does something
+    # other than what we think, this stops after six tries instead of
+    # shuffling the table forever.
+    ROTATE_RETRY_S = 3.0
+    MAX_ROTATIONS = 6
+
+    # Class-level defaults, so a bot built any other way than through
+    # __init__ -- the tests construct one with __new__ -- is simply a bot
+    # playing alone, rather than an AttributeError on the first frame.
+    partner = None
+    is_host = False
+
     def __init__(self, config: Config = None, agent=None, agent_kwargs=None):
         self.config = config or Config.from_env()
         self.client = BelotClient(
@@ -61,6 +76,14 @@ class LiveBelotBot:
             agent = get_agent(self.config.agent, **kwargs)
         self.agent = agent
         print(f"[Bot] Agent: {getattr(self.agent, 'name', type(self.agent).__name__)}")
+
+        # Playing as a pair, and whether we are the one who made the table.
+        # Only the creator can move players between seats.
+        self.partner = (self.config.partner or "").strip().casefold() or None
+        self.is_host = self.config.table_mode == "create"
+        if self.partner:
+            print(f"[Bot] Paired run: holding READY until our partner sits "
+                  f"opposite ({'host' if self.is_host else 'guest'}).")
 
         self._room_seq = 0
         self._reset_room_state()
@@ -119,6 +142,9 @@ class LiveBelotBot:
         self._swap_hand = None        # hand_id of the open phase-8 window
         self._swap_sent = False       # SWAP_SEVEN sent in that window
         self._swap_skip = False       # decided not to swap this window
+        self._rotations = 0           # seat rotations sent at THIS table
+        self._rotate_ts = 0.0         # last one, for the debounce
+        self._seat_map = None         # last seat layout we reported
 
     def _check_room_change(self):
         """Notice that the client joined a different table and start clean."""
@@ -201,6 +227,13 @@ class LiveBelotBot:
         # sent it, and sat in the lobby forever.
         if phase == NOT_STARTED or phase in END_PHASES:
             self._agent_reset()
+            # Playing as a pair: the seats have to be right BEFORE we announce
+            # ourselves. The match starts the moment all four players are
+            # ready, so a READY sent at the wrong moment is what puts our two
+            # accounts on opposite teams -- and nobody can start without us.
+            if self._seats_are_wrong(raw_state, my_pos):
+                await self._fix_seats(raw_state, my_pos)
+                return
             if not self._server_says_ready(raw_state, my_pos):
                 await self._send_ready_debounced()
             return
@@ -249,6 +282,63 @@ class LiveBelotBot:
             self.last_dispatch_ts = now
 
             await self._select_and_execute_action(my_pos, turn_id)
+
+    def _partner_seat(self, raw_state):
+        """Where our other account is sitting, or None if it is not here.
+
+        Matched on the username we were configured with. No other player's
+        name is read, compared or recorded.
+        """
+        if not self.partner:
+            return None
+        for seat, player in enumerate(raw_state.get("players") or []):
+            if (player.get("name") or "").strip().casefold() == self.partner:
+                return seat
+        return None
+
+    def _seats_are_wrong(self, raw_state, my_pos):
+        """True while we are a pair and our partner is not opposite us."""
+        if not self.partner:
+            return False
+        return self._partner_seat(raw_state) != (my_pos + 2) % 4
+
+    async def _fix_seats(self, raw_state, my_pos):
+        """Hold READY, and -- if we made this table -- rotate the seats.
+
+        Rotation is the creator's to do, so the guest simply waits. Both log
+        the layout, by ROLE rather than by name: which seats are ours is the
+        whole question, and the strangers at the table are nobody's business.
+        """
+        players = raw_state.get("players") or []
+        partner_seat = self._partner_seat(raw_state)
+        seated = sum(1 for p in players if p.get("id"))
+
+        layout = tuple("us" if s == my_pos else
+                       "partner" if s == partner_seat else
+                       "other" if s < len(players) and players[s].get("id")
+                       else "empty" for s in range(4))
+        if layout != self._seat_map:
+            self._seat_map = layout
+            print(f"[Bot] seats {' '.join(f'{s}={r}' for s, r in enumerate(layout))}"
+                  f" -- holding READY until our partner sits at seat "
+                  f"{(my_pos + 2) % 4}.")
+
+        if not self.is_host or partner_seat is None or seated < 4:
+            # Nothing to rotate yet: an empty seat will be filled by whoever
+            # sits down next, and that changes the arrangement anyway.
+            return
+        if self._rotations >= self.MAX_ROTATIONS:
+            return
+        now = time.monotonic()
+        if now - self._rotate_ts < self.ROTATE_RETRY_S:
+            return
+
+        self._rotate_ts = now
+        self._rotations += 1
+        print(f"[Bot] rotating the other seats "
+              f"({self._rotations}/{self.MAX_ROTATIONS}) to put our partner "
+              f"opposite.")
+        await self.client.change_players_position()
 
     @staticmethod
     def _server_says_ready(raw_state, my_pos):
