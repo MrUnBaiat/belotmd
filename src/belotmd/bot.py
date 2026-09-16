@@ -59,6 +59,14 @@ class LiveBelotBot:
     # if it were restarted whenever somebody left and was replaced, a table
     # that churns one seat forever would never time out at all.
     TABLE_START_GRACE_S = 30.0
+    # Every seat taken and none of them our partner's. A moment's patience
+    # first: our partner may be a second behind the strangers, and deleting
+    # ejects three people who just sat down.
+    FULL_WITHOUT_PARTNER_GRACE_S = 5.0
+    # Our partner never turned up at all and the table never filled either --
+    # a quiet lobby, or a guest that cannot see us. Matches the guest's own
+    # window (20 looks x 2s), so both sides give up at about the same moment.
+    NO_PARTNER_GIVE_UP_S = 40.0
     # Deleting a table ejects three people. A persistent problem must not turn
     # into an endless create-and-delete loop.
     MAX_RECREATES = 5
@@ -87,6 +95,9 @@ class LiveBelotBot:
             table_mode=self.config.table_mode,
             table_id=self.config.table_id or None,
             table_creator=self.config.table_creator or None,
+            join_poll_s=self.config.join_poll_s,
+            join_max_polls=self.config.join_max_polls,
+            pair_restart_pause_s=self.config.pair_restart_pause_s,
         )
         self.sync_engine = StateSynchronizer()
 
@@ -192,6 +203,7 @@ class LiveBelotBot:
         self._probe_done = 0          # probe rotations sent at THIS table
         self._seat_labels = {}        # player id -> a letter, per table
         self._full_since = None       # when this table FIRST filled up
+        self._room_since = None       # when we arrived at this table
         self._leave_sent = False      # one LEAVE_TABLE per table, at most
         self._table_started = False   # has a hand been dealt here?
 
@@ -422,6 +434,8 @@ class LiveBelotBot:
         # that churns one seat could keep us waiting for ever.
         if seated >= 4 and self._full_since is None:
             self._full_since = now
+        if self._room_since is None:
+            self._room_since = now
 
         if self.is_host and not self._table_started:
             # The deliberate experiment, before anything can go wrong on its
@@ -438,9 +452,20 @@ class LiveBelotBot:
             if seated >= 4 and partner_seat is None:
                 # Every seat taken and none of them ours: this can never become
                 # the table we want, and we will not spend a rated hand on a
-                # stranger as partner.
+                # stranger as partner. Wait a few seconds first in case our
+                # partner is simply a step behind.
+                if now - self._full_since >= self.FULL_WITHOUT_PARTNER_GRACE_S:
+                    await self._recreate_table(
+                        f"the table filled up without our partner "
+                        f"{self.FULL_WITHOUT_PARTNER_GRACE_S:.0f}s ago")
+                return True
+            if (partner_seat is None
+                    and now - self._room_since > self.NO_PARTNER_GIVE_UP_S):
+                # Never filled, and our partner never came. Nothing here is
+                # going to change on its own.
                 await self._recreate_table(
-                    "the table filled up without our partner")
+                    f"{self.NO_PARTNER_GIVE_UP_S:.0f}s at this table and our "
+                    f"partner has not arrived")
                 return True
             if (self._full_since is not None
                     and now - self._full_since > self.TABLE_START_GRACE_S):

@@ -133,6 +133,20 @@ class Config:
     # A match ended or the table dissolved -- go straight back out.
     rejoin_delay_s: float = 5.0
 
+    # --- finding our partner's table ---
+    # The guest watches the lobby for the host's table. Two seconds, because
+    # on a busy lobby a freshly created table is taken by strangers within a
+    # few: polling slower than they arrive is what makes the host delete table
+    # after table. `gameTables.php` is cheap and the site tolerates it.
+    join_poll_s: float = 2.0
+    # Fruitless looks before giving up on this attempt. 20 x 2s = 40s, the
+    # same window the host allows before abandoning a table nobody joined.
+    join_max_polls: int = 20
+    # After a failed pairing, BOTH sides sit still for this long before trying
+    # again -- the host having deleted its table, the guest having stopped
+    # looking. Restarting instantly just recreates the same race.
+    pair_restart_pause_s: float = 10.0
+
     # --- timing ---
     # If the state has not advanced this long after we dispatched an action,
     # assume the server refused it and re-dispatch. A successful action always
@@ -185,6 +199,9 @@ class Config:
             reconnect=_flag(lookup, "BELOT_RECONNECT", True),
             retry_delay_s=float(lookup.get("BELOT_RETRY_DELAY", 300)),
             rejoin_delay_s=float(lookup.get("BELOT_REJOIN_DELAY", 5)),
+            join_poll_s=float(lookup.get("BELOT_JOIN_POLL", 2)),
+            join_max_polls=int(lookup.get("BELOT_JOIN_MAX_POLLS", 20)),
+            pair_restart_pause_s=float(lookup.get("BELOT_PAIR_RESTART_PAUSE", 10)),
             env_file=str(env_file or ""),
         )
         for key, value in overrides.items():

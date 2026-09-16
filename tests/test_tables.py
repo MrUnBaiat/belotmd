@@ -191,13 +191,13 @@ def test_the_guest_joins_the_table_its_partner_created():
 
 
 def test_the_guest_waits_and_asks_again_while_the_table_is_missing():
-    """The host may still be creating it. A short wait, then look again."""
+    """The host may still be creating it. A brief wait, then look again."""
     bridge, slept = _drive(
         [{"event": "LOBBY", "mese": [SOMEONE_ELSE]},
          {"event": "LOBBY", "mese": [SOMEONE_ELSE, OURS]}],
-        table_mode="join", table_creator=HOST, rejoin_delay_s=5)
+        table_mode="join", table_creator=HOST, rejoin_delay_s=5, join_poll_s=2)
 
-    assert slept == [5], "short wait, not the five-minute empty-lobby one"
+    assert slept == [2], "the watch cadence, not the between-matches delay"
     assert len(bridge.of("LOBBY")) == 2, "should have looked again"
     assert bridge.of("CONNECT")[0]["table"]["tableId"] == "new-44709391"
 
@@ -215,7 +215,9 @@ def test_a_guest_never_falls_into_the_long_wait():
         table_mode="join", table_creator=HOST,
         rejoin_delay_s=5, retry_delay_s=300)
 
-    assert slept == [5]
+    assert slept == [2], (
+        "a failed join is a spent look: back on the watch cadence, and "
+        "nowhere near the five-minute wait")
 
 
 def test_a_vanished_table_is_told_apart_from_an_empty_lobby():
@@ -236,6 +238,70 @@ def test_an_empty_lobby_still_waits():
         rejoin_delay_s=5, retry_delay_s=300)
 
     assert slept == [300]
+
+
+def test_the_guest_looks_again_after_two_seconds():
+    """A freshly created table is taken by strangers within a few seconds, so
+    the watch has to be quicker than they are."""
+    bridge, slept = _drive(
+        [{"event": "LOBBY", "mese": [SOMEONE_ELSE]},
+         {"event": "LOBBY", "mese": [SOMEONE_ELSE, OURS]}],
+        table_mode="join", table_creator=HOST,
+        join_poll_s=2, join_max_polls=20, pair_restart_pause_s=10)
+
+    assert slept == [2]
+    assert bridge.of("CONNECT")[0]["table"]["tableId"] == "new-44709391"
+
+
+def test_a_table_that_filled_up_is_not_worth_watching():
+    """It can never become ours now. Stand down, let the host delete it, and
+    start the next attempt together rather than hammering the lobby."""
+    bridge, slept = _drive([{"event": "LOBBY", "mese": [FULL]}],
+                           table_mode="join", table_id="new-44711111",
+                           join_poll_s=2, pair_restart_pause_s=10)
+
+    assert slept == [10], "the pause both sides take before trying again"
+    assert not bridge.of("CONNECT")
+
+
+def test_the_guest_stands_down_once_its_budget_is_spent():
+    bridge, slept = _drive(
+        [{"event": "LOBBY", "mese": []} for _ in range(3)],
+        table_mode="join", table_creator=HOST,
+        join_poll_s=2, join_max_polls=3, pair_restart_pause_s=10)
+
+    assert slept == [2, 2, 10], "three looks, then stand down"
+
+
+def test_joining_restores_the_full_budget():
+    """Otherwise a long-lived pairing would exhaust its looks and stand down
+    in the middle of a perfectly good run of tables."""
+    bridge, slept = _drive(
+        [{"event": "LOBBY", "mese": []},
+         {"event": "LOBBY", "mese": [OURS]},
+         {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+         {"event": "LOBBY", "mese": []},
+         {"event": "LOBBY", "mese": []}],
+        table_mode="join", table_creator=HOST,
+        join_poll_s=2, join_max_polls=2, pair_restart_pause_s=10)
+
+    assert slept == [2, 2, 10], "the count restarted after the join"
+
+
+def test_the_poll_settings_reach_the_client():
+    """The knobs live on Config and are used by the client -- easy to add in
+    one place and never wire up."""
+    from belotmd.bot import LiveBelotBot
+    from belotmd.config import Config
+
+    bot = LiveBelotBot(config=Config(
+        cookies="x", audit=False, agent="random", table_mode="join",
+        table_creator=HOST, join_poll_s=1.5, join_max_polls=7,
+        pair_restart_pause_s=11))
+
+    assert bot.client.join_poll_s == 1.5
+    assert bot.client.join_max_polls == 7
+    assert bot.client.pair_restart_pause_s == 11.0
 
 
 def test_the_guest_does_not_squeeze_into_a_full_table():

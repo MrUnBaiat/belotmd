@@ -286,6 +286,19 @@ def test_a_leave_we_asked_for_in_order_to_restart_does_not_end_the_run():
     assert ws.joins == 2, "must go and make another table"
 
 
+def test_a_deliberate_leave_settles_before_trying_again():
+    """Both sides stand still after a failed pairing -- the host having
+    deleted its table, the guest having stopped looking. Recreating instantly
+    just walks back into the same race."""
+    ws, slept, _ = _run_connect([
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+        {"event": "LEAVE", "code": LEAVE_TABLE_REMOVED},
+        {"event": "CONNECTED", "roomId": "r2", "playerId": "p"},
+    ], prepare=_leaving, rejoin_delay_s=5, pair_restart_pause_s=10)
+
+    assert slept == [10], "the settling pause, not the ordinary rejoin delay"
+
+
 def test_deleting_our_own_table_arrives_as_table_removed_and_still_recovers():
     """As the creator, leaving deletes the table, so the close may come back as
     TABLE_REMOVED rather than I_LEFT. Neither may end the run."""

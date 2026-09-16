@@ -213,12 +213,35 @@ def test_a_paired_bot_waits_for_the_table_to_fill():
     assert client.readies == 0
 
 
-def test_a_full_table_without_our_partner_is_abandoned():
-    """It can never become the table we want, and we will not spend a rated
-    hand with a stranger as partner."""
-    client = _feed(_bot(), _lobby(["a", "b", "c", ME]), times=5)
-    assert client.leaves == 1, "exactly one, however many frames arrive"
-    assert client.readies == 0
+def test_a_full_table_without_our_partner_gets_a_few_seconds_first():
+    """It can never become the table we want -- but our partner may be a step
+    behind the strangers, and deleting ejects three people who just sat down."""
+    bot = _bot()
+    seats = _lobby(["a", "b", "c", ME])
+
+    _feed(bot, seats, times=3)
+    assert bot.client.leaves == 0, "not before the grace has passed"
+    assert bot.client.readies == 0
+
+    bot._full_since -= bot.FULL_WITHOUT_PARTNER_GRACE_S + 1
+    _feed(bot, seats, times=3)
+
+    assert bot.client.leaves == 1, "exactly one, however many frames arrive"
+
+
+def test_a_table_our_partner_never_reaches_is_abandoned():
+    """The other half: it never fills either, so nothing about it will change
+    on its own -- a quiet lobby, or a guest that cannot see us."""
+    bot = _bot()
+    seats = _lobby(["a", None, None, ME])
+
+    _feed(bot, seats)
+    assert bot.client.leaves == 0
+
+    bot._room_since -= bot.NO_PARTNER_GIVE_UP_S + 1
+    _feed(bot, seats)
+
+    assert bot.client.leaves == 1
 
 
 def test_the_guest_never_deletes_a_table():
@@ -279,9 +302,12 @@ def test_abandoning_tables_is_capped():
     """A persistent problem must not become an endless create-and-delete loop:
     every deletion ejects three people."""
     bot = _bot()
+    seats = _lobby(["a", "b", "c", ME])
     for _ in range(LiveBelotBot.MAX_RECREATES + 3):
         bot.client.sessions_played += 1              # a fresh table each time
-        _feed(bot, _lobby(["a", "b", "c", ME]))
+        _feed(bot, seats)                            # arms the grace
+        bot._full_since -= bot.FULL_WITHOUT_PARTNER_GRACE_S + 1
+        _feed(bot, seats)                            # now it may abandon
 
     assert bot.client.leaves == LiveBelotBot.MAX_RECREATES == 5
 

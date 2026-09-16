@@ -30,7 +30,9 @@ class BelotClient:
     def __init__(self, cookies: str, bridge_port: int = 0,
                  reconnect: bool = True, retry_delay_s: float = 300.0,
                  rejoin_delay_s: float = 5.0, table_mode: str = "lobby",
-                 table_id: str = None, table_creator: str = None):
+                 table_id: str = None, table_creator: str = None,
+                 join_poll_s: float = 2.0, join_max_polls: int = 20,
+                 pair_restart_pause_s: float = 10.0):
         """`reconnect` keeps the bot looking for tables instead of exiting.
 
         Two delays, because two very different situations end a session:
@@ -56,6 +58,12 @@ class BelotClient:
         self.table_mode = table_mode
         self.table_id = table_id
         self.table_creator = table_creator
+        # Watching the lobby for our partner's table: how often, and how many
+        # fruitless looks before standing down for a while.
+        self.join_poll_s = float(join_poll_s)
+        self.join_max_polls = int(join_max_polls)
+        self.pair_restart_pause_s = float(pair_restart_pause_s)
+        self._join_polls = 0
         self.reconnect = reconnect
         self.retry_delay_s = float(retry_delay_s)
         self.rejoin_delay_s = float(rejoin_delay_s)
@@ -190,6 +198,7 @@ class BelotClient:
                     self.my_player_id = msg.get("playerId")
                     self._in_room = True
                     self._phase = NOT_STARTED
+                    self._join_polls = 0
                     self.sessions_played += 1
                     print(f"[SDK] Joined Game Room: {self.room_id} | Player ID: {self.my_player_id}")
                     await self.deactivate_bot()
@@ -224,20 +233,37 @@ class BelotClient:
                                         table_id=self.table_id,
                                         creator=self.table_creator)
                     who = self.table_creator or self.table_id
-                    if wanted is None:
-                        if not await self._recover(
-                                ws, RECOVER_SOON,
-                                f"{who}'s table is not in the lobby yet"):
-                            break
-                    elif not is_joinable(wanted):
-                        if not await self._recover(
-                                ws, RECOVER_SOON,
-                                f"{who}'s table has no free seat"):
-                            break
-                    else:
+
+                    if wanted is not None and is_joinable(wanted):
                         found = table_id_of(wanted)
                         print(f"[SDK] Found {who}'s table {found}; taking a seat.")
+                        self._join_polls = 0
                         await self._request_table(ws, table_id=found)
+                        continue
+
+                    # Either it is not listed yet, or strangers have taken
+                    # every seat. A full table can never become ours, so there
+                    # is nothing to watch for: stand down, let the host delete
+                    # it, and start the next attempt together.
+                    self._join_polls += 1
+                    full = wanted is not None
+                    spent = self._join_polls >= self.join_max_polls
+                    if full or spent:
+                        why = ("it filled up before we got a seat" if full else
+                               f"{self._join_polls} looks and it never appeared")
+                        self._join_polls = 0
+                        if not await self._recover(
+                                ws, RECOVER_SOON,
+                                f"{who}'s table: {why} -- standing down",
+                                delay=self.pair_restart_pause_s):
+                            break
+                    else:
+                        if not await self._recover(
+                                ws, RECOVER_SOON,
+                                f"{who}'s table is not in the lobby yet "
+                                f"({self._join_polls}/{self.join_max_polls})",
+                                delay=self.join_poll_s):
+                            break
 
                 elif event == "ERROR":
                     detail = msg.get("message") or msg.get("code")
@@ -256,15 +282,23 @@ class BelotClient:
                         # asleep while the host churned through five tables.
                         soon = (msg.get("code") == "TABLE_NOT_FOUND"
                                 or self.table_mode == "join")
+                        # A failed join is a spent look like any other, and it
+                        # keeps the guest on its 2s cadence rather than the
+                        # 5s one meant for "a match just ended".
+                        joining = self.table_mode == "join"
+                        if joining:
+                            self._join_polls += 1
                         if not await self._recover(
                                 ws, RECOVER_SOON if soon else RECOVER_LATER,
-                                f"could not join a table ({detail})"):
+                                f"could not join a table ({detail})",
+                                delay=self.join_poll_s if joining else None):
                             break
 
                 elif event == "LEAVE":
                     code = msg.get("code")
                     label = LEAVE_NAMES.get(code, "UNKNOWN")
                     self._in_room = False
+                    restart_pause = None
                     if self._leaving_to_restart:
                         # We asked for this. The policy for a leave we
                         # requested is to STOP -- correct when a person means
@@ -274,8 +308,10 @@ class BelotClient:
                         # or as TABLE_REMOVED; neither should end the run.
                         self._leaving_to_restart = False
                         action = RECOVER_SOON
+                        restart_pause = self.pair_restart_pause_s
                         print(f"[SDK] left that table on purpose ({label}); "
-                              f"finding or making another.")
+                              f"settling for {restart_pause:.0f}s, then making "
+                              f"another.")
                     else:
                         action = leave_recovery(code)
 
@@ -303,7 +339,8 @@ class BelotClient:
 
                     if not await self._recover(
                             ws, action, f"{label} ({code})",
-                            avoid_last=(code == LEAVE_KICKED)):
+                            avoid_last=(code == LEAVE_KICKED),
+                            delay=restart_pause):
                         break
 
             await self._queue.put((None, None))     # drain sentinel
@@ -336,8 +373,13 @@ class BelotClient:
             request["table"] = {"mode": "join", "tableId": table_id}
         await ws.send(json.dumps(request))
 
-    async def _recover(self, ws, action, reason, avoid_last=False):
-        """Act on a recovery decision. -> True to keep the session alive."""
+    async def _recover(self, ws, action, reason, avoid_last=False, delay=None):
+        """Act on a recovery decision. -> True to keep the session alive.
+
+        `delay` overrides the wait the action would imply, for the cases that
+        have their own cadence: watching the lobby for a partner's table, and
+        standing down after a pairing failed.
+        """
         if action == RECOVER_STOP:
             print(f"[SDK] Session ended: {reason}. Not rejoining.")
             return False
@@ -345,9 +387,10 @@ class BelotClient:
             print(f"[SDK] {reason}; --once was requested, so stopping.")
             return False
 
-        delay = {RECOVER_NOW: 0.0,
-                 RECOVER_SOON: self.rejoin_delay_s,
-                 RECOVER_LATER: self.retry_delay_s}[action]
+        if delay is None:
+            delay = {RECOVER_NOW: 0.0,
+                     RECOVER_SOON: self.rejoin_delay_s,
+                     RECOVER_LATER: self.retry_delay_s}[action]
         if delay:
             print(f"[SDK] {reason}; looking for another table in "
                   f"{delay:.0f}s. ({self.sessions_played} played so far)")
