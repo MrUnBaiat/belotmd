@@ -143,8 +143,15 @@ async function connectToGame(cookieString, say, session, avoidLast = false,
             // same pooled connection then stalls -- no error, no timeout, no
             // log line. The first live run hung here for minutes, having
             // created nothing.
+            // The body is sent VERBATIM as a string, so it needs its content
+            // type spelled out: fetch labels a string body `text/plain`, PHP
+            // then parses no fields at all, and the server answers 200 with an
+            // EMPTY body having created nothing. (The lobby call gets away with
+            // it because URLSearchParams sets the header itself.)
             const createRes = await fetch("https://belot.md/gameTables.php", {
-                method: "POST", headers, body: table.body, redirect: "follow",
+                method: "POST", redirect: "follow",
+                headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
+                body: table.body,
                 signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
             const html = await createRes.text();      // always drain the body
             if (createRes.status >= 400) {
