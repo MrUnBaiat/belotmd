@@ -217,9 +217,11 @@ class _FakeWS(FakeBridge):
         return False
 
 
-def _run_connect(script, **kwargs):
+def _run_connect(script, prepare=None, **kwargs):
     """Drive BelotClient.connect() itself, with the daemon stubbed out."""
     client = BelotClient(cookies="x", **kwargs)
+    if prepare is not None:
+        prepare(client)
     ws = _FakeWS(script)
     client._start_node_daemon = lambda: None
 
@@ -266,6 +268,59 @@ def test_connect_itself_retries_when_the_lobby_is_empty():
     assert ws.joins == 3, "one initial join plus two recoveries"
     assert slept == [300, 5], "long wait for an empty lobby, short after a match"
     assert sent.count("BOT_ACTIVATION") == 2, "must deactivate on every join"
+
+
+def _leaving(client):
+    client._leaving_to_restart = True
+
+
+def test_a_leave_we_asked_for_in_order_to_restart_does_not_end_the_run():
+    """THE TRAP: the policy for I_LEFT is STOP -- right when a person means "I
+    am done", fatal when the bot means "this table is no good, make another".
+    Without this the first deleted table would quietly end an overnight run."""
+    ws, _, _ = _run_connect([
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+        {"event": "LEAVE", "code": LEAVE_I_LEFT},
+        {"event": "CONNECTED", "roomId": "r2", "playerId": "p"},
+    ], prepare=_leaving)
+    assert ws.joins == 2, "must go and make another table"
+
+
+def test_deleting_our_own_table_arrives_as_table_removed_and_still_recovers():
+    """As the creator, leaving deletes the table, so the close may come back as
+    TABLE_REMOVED rather than I_LEFT. Neither may end the run."""
+    ws, _, _ = _run_connect([
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+        {"event": "LEAVE", "code": LEAVE_TABLE_REMOVED},
+        {"event": "CONNECTED", "roomId": "r2", "playerId": "p"},
+    ], prepare=_leaving)
+    assert ws.joins == 2
+
+
+def test_the_restart_flag_is_spent_once():
+    """A later, genuine 'we are done' must still stop the session."""
+    ws, _, _ = _run_connect([
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+        {"event": "LEAVE", "code": LEAVE_I_LEFT},      # deliberate: recovers
+        {"event": "CONNECTED", "roomId": "r2", "playerId": "p"},
+        {"event": "LEAVE", "code": LEAVE_I_LEFT},      # not ours: stops
+        {"event": "CONNECTED", "roomId": "r3", "playerId": "p"},
+    ], prepare=_leaving)
+    assert ws.joins == 2, "the second leave must end the session"
+
+
+def test_leaving_sends_the_message_and_arms_the_flag():
+    client = BelotClient(cookies="x")
+    sent = []
+
+    async def fake_send(action_type, payload):
+        sent.append((action_type, payload))
+    client._send = fake_send
+
+    asyncio.run(client.leave_table())
+
+    assert sent == [("LEAVE_TABLE", {})], "payload mirrors PASS and SWAP_SEVEN"
+    assert client._leaving_to_restart is True
 
 
 def test_connect_stops_on_a_terminal_code():

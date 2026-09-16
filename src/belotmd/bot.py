@@ -54,12 +54,26 @@ class LiveBelotBot:
     # experiment needs a wider gap than the ordinary fix-the-seats path.
     ROTATE_PROBE_GAP_S = 8.0
 
+    # How long a FULL table gets to start a match before we give up on it and
+    # make another. Armed the first time the table fills and never re-armed:
+    # if it were restarted whenever somebody left and was replaced, a table
+    # that churns one seat forever would never time out at all.
+    TABLE_START_GRACE_S = 30.0
+    # Deleting a table ejects three people. A persistent problem must not turn
+    # into an endless create-and-delete loop.
+    MAX_RECREATES = 5
+
     # Class-level defaults, so a bot built any other way than through
     # __init__ -- the tests construct one with __new__ -- is simply a bot
     # playing alone, rather than an AttributeError on the first frame.
     partner = None
     is_host = False
     rotation_probe = 0
+    # Counted across tables. Class-level so that a bot built any other way than
+    # through __init__ still has them; both are immutable, and __init__ gives
+    # every real instance its own.
+    _recreates = 0
+    _recreate_capped = False
 
     def __init__(self, config: Config = None, agent=None, agent_kwargs=None):
         self.config = config or Config.from_env()
@@ -100,6 +114,12 @@ class LiveBelotBot:
         if self.partner:
             print(f"[Bot] Paired run: holding READY until our partner sits "
                   f"opposite ({'host' if self.is_host else 'guest'}).")
+
+        # Counted across tables, not per table: five bad tables in a row is a
+        # problem with us, not with the tables. Reset as soon as a hand is
+        # actually dealt somewhere.
+        self._recreates = 0
+        self._recreate_capped = False
 
         self._room_seq = 0
         self._reset_room_state()
@@ -163,7 +183,9 @@ class LiveBelotBot:
         self._seat_map = None         # last seat layout we reported
         self._probe_done = 0          # probe rotations sent at THIS table
         self._seat_labels = {}        # player id -> a letter, per table
-        self._rotation_gave_up = False
+        self._full_since = None       # when this table FIRST filled up
+        self._leave_sent = False      # one LEAVE_TABLE per table, at most
+        self._table_started = False   # has a hand been dealt here?
 
     def _check_room_change(self):
         """Notice that the client joined a different table and start clean."""
@@ -250,12 +272,18 @@ class LiveBelotBot:
             # ourselves. The match starts the moment all four players are
             # ready, so a READY sent at the wrong moment is what puts our two
             # accounts on opposite teams -- and nobody can start without us.
-            if self._seats_are_wrong(raw_state, my_pos) or self._probe_pending(raw_state):
-                await self._fix_seats(raw_state, my_pos)
+            if await self._manage_table(raw_state, my_pos):
                 return
             if not self._server_says_ready(raw_state, my_pos):
                 await self._send_ready_debounced()
             return
+
+        # A hand is being dealt here, so this table worked: forget the tally of
+        # abandoned ones. The cap counts tables that went wrong IN A ROW.
+        if self.partner and not self._table_started:
+            self._table_started = True
+            self._recreates = 0
+            self._recreate_capped = False
 
         # 2. Cut deck phase
         if phase == 2 and active_player == my_pos:
@@ -321,6 +349,23 @@ class LiveBelotBot:
             return False
         return self._partner_seat(raw_state) != (my_pos + 2) % 4
 
+    def _ready_blocked(self, raw_state, my_pos):
+        """Should we withhold READY?
+
+        Playing alone: never -- announce yourself at once, exactly as before.
+        This is the single-agent path and nothing above changes it.
+
+        Playing as a pair: ready up only at a FULL table with our partner
+        opposite us. Readying earlier is how a fourth player arriving starts a
+        match instantly, with whoever happens to be sitting across from us.
+        """
+        if not self.partner:
+            return False
+        players = raw_state.get("players") or []
+        if sum(1 for p in players if p.get("id")) < 4:
+            return True
+        return self._partner_seat(raw_state) != (my_pos + 2) % 4
+
     @staticmethod
     def _rotations_needed(my_pos, partner_seat):
         """How many rotations put our partner opposite us.
@@ -335,6 +380,54 @@ class LiveBelotBot:
             return 0
         target = (my_pos + 2) % 4
         return (others.index(target) - others.index(partner_seat)) % 3
+
+    async def _manage_table(self, raw_state, my_pos):
+        """Decide what this table is worth, every idle frame.
+
+        -> True when READY must be withheld, or when we are walking away.
+
+        This runs whether or not the seats are right, because the case it
+        exists for is a table that is FULL and correct and still does not
+        start: somebody sat down and never readied up. Judging that from
+        inside the fix-the-seats branch would never fire, since a correct
+        table never enters it.
+
+        Playing alone, this does nothing at all -- the single-agent bot
+        readies up immediately, exactly as it always has.
+        """
+        if not self.partner:
+            return False
+
+        players = raw_state.get("players") or []
+        seated = sum(1 for p in players if p.get("id"))
+        partner_seat = self._partner_seat(raw_state)
+        now = time.monotonic()
+
+        # Armed the FIRST time this table fills, and never re-armed. Restarting
+        # it whenever somebody leaves and is replaced is precisely how a table
+        # that churns one seat could keep us waiting for ever.
+        if seated >= 4 and self._full_since is None:
+            self._full_since = now
+
+        if self.is_host and not self._table_started:
+            if seated >= 4 and partner_seat is None:
+                # Every seat taken and none of them ours: this can never become
+                # the table we want, and we will not spend a rated hand on a
+                # stranger as partner.
+                await self._recreate_table(
+                    "the table filled up without our partner")
+                return True
+            if (self._full_since is not None
+                    and now - self._full_since > self.TABLE_START_GRACE_S):
+                await self._recreate_table(
+                    f"{self.TABLE_START_GRACE_S:.0f}s since this table filled "
+                    f"and still no match -- somebody is not readying up")
+                return True
+
+        if self._ready_blocked(raw_state, my_pos) or self._probe_pending(raw_state):
+            await self._fix_seats(raw_state, my_pos)
+            return True
+        return False
 
     def _seat_layout(self, players, my_pos, partner_seat):
         """Who sits where, named so that MOVEMENT is visible but people are not.
@@ -386,13 +479,12 @@ class LiveBelotBot:
             print(f"[Bot] seats {where} -- holding READY (our partner belongs "
                   f"at seat {(my_pos + 2) % 4}).")
 
-        if not self.is_host or partner_seat is None:
-            return
-
         now = time.monotonic()
+        if not self.is_host:
+            return                      # the guest can only wait
 
         # The experiment comes first, and ignores whether the seats are right.
-        if self._probe_done < self.rotation_probe:
+        if partner_seat is not None and self._probe_done < self.rotation_probe:
             if now - self._rotate_ts < self.ROTATE_PROBE_GAP_S:
                 return
             self._rotate_ts = now
@@ -404,17 +496,17 @@ class LiveBelotBot:
             await self.client.change_players_position()
             return
 
-        if seated < 4:
+        if partner_seat is None or seated < 4:
             # Nothing to rotate yet: an empty seat will be filled by whoever
             # sits down next, and that changes the arrangement anyway.
             return
         if self._rotations >= self.MAX_ROTATIONS:
-            if not self._rotation_gave_up:
-                self._rotation_gave_up = True
-                print(f"[Bot][WARN] {self._rotations} rotations and our partner "
-                      f"is still not opposite. Two should always be enough, so "
-                      f"the seat rule is not behaving as measured. Holding "
-                      f"READY rather than shuffling this table any further.")
+            # Two rotations always suffice, so a third means the seat rule is
+            # not behaving as measured. Take a different table rather than
+            # shuffling this one on a broken assumption.
+            await self._recreate_table(
+                f"{self._rotations} rotations and our partner is still not "
+                f"opposite, which should be impossible")
             return
         if now - self._rotate_ts < self.ROTATE_RETRY_S:
             return
@@ -428,6 +520,30 @@ class LiveBelotBot:
         print(f"[Bot] rotating the other seats ({self._rotations}/"
               f"{self.MAX_ROTATIONS}); {needed} rotation(s) should do it.")
         await self.client.change_players_position()
+
+    async def _recreate_table(self, reason):
+        """Abandon this table and make another one.
+
+        As the creator, leaving DELETES the table and ejects everyone sitting
+        at it -- so at most one per table, and a hard cap per run. If five
+        tables in a row go wrong, the problem is not the tables, and churning
+        the lobby is worse than waiting.
+        """
+        if self._leave_sent:
+            return
+        if self._recreates >= self.MAX_RECREATES:
+            if not self._recreate_capped:
+                self._recreate_capped = True
+                print(f"[Bot][WARN] {reason} -- but {self._recreates} tables "
+                      f"have already been abandoned. Waiting here instead of "
+                      f"churning the lobby.")
+            return
+
+        self._leave_sent = True
+        self._recreates += 1
+        print(f"[Bot] {reason}; deleting this table and making another "
+              f"({self._recreates}/{self.MAX_RECREATES}).")
+        await self.client.leave_table()
 
     @staticmethod
     def _server_says_ready(raw_state, my_pos):

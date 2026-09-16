@@ -29,6 +29,7 @@ class StubClient:
     def __init__(self):
         self.readies = 0
         self.rotations = 0
+        self.leaves = 0
         self.sessions_played = 1
 
     async def send_ready(self, value=True):
@@ -36,6 +37,9 @@ class StubClient:
 
     async def change_players_position(self):
         self.rotations += 1
+
+    async def leave_table(self, restart=True):
+        self.leaves += 1
 
 
 def _bot(partner=PARTNER, table_mode="create", rotation_probe=0):
@@ -182,6 +186,116 @@ def test_a_new_table_starts_its_rotation_count_again():
     assert bot.client.rotations == LiveBelotBot.MAX_ROTATIONS + 1
 
 
+# ------------------------------------------- waiting for the RIGHT table
+#
+# Readying up early is how a fourth player's arrival starts a match instantly,
+# with whoever happens to be sitting opposite. A paired bot therefore readies
+# only at a full table with its partner across from it -- and if the table
+# cannot become that, it makes another one.
+
+def test_a_bot_playing_alone_readies_at_a_half_empty_table():
+    """The single-agent path is untouched by all of this: it announces itself
+    at once, whoever else is or is not there."""
+    client = _feed(_bot(partner=None, table_mode="lobby"),
+                   _lobby(["a", None, None, ME]))
+    assert client.readies == 1
+    assert client.leaves == 0, "and it never abandons a table"
+
+
+def test_a_paired_bot_waits_for_the_table_to_fill():
+    """Even with our partner already opposite: readying now means the next
+    person to sit down starts the match."""
+    client = _feed(_bot(), _lobby(["a", PARTNER, None, ME]))
+    assert client.readies == 0
+
+
+def test_a_full_table_without_our_partner_is_abandoned():
+    """It can never become the table we want, and we will not spend a rated
+    hand with a stranger as partner."""
+    client = _feed(_bot(), _lobby(["a", "b", "c", ME]), times=5)
+    assert client.leaves == 1, "exactly one, however many frames arrive"
+    assert client.readies == 0
+
+
+def test_the_guest_never_deletes_a_table():
+    """Only the creator can, and it would be the wrong bot's decision anyway."""
+    client = _feed(_bot(table_mode="join"), _lobby(["a", "b", "c", ME]), times=5)
+    assert client.leaves == 0
+
+
+def test_a_full_table_that_never_starts_is_abandoned():
+    """Four players, we are ready, and somebody simply never readies up.
+    Nothing is wrong with the seats, so the seat logic never examines this
+    table -- the timer has to."""
+    bot = _bot()
+    seats = _lobby(["a", PARTNER, "c", ME])     # partner opposite: all correct
+
+    _feed(bot, seats)                            # arms the clock, readies up
+    assert bot.client.readies == 1
+    assert bot._full_since is not None
+    assert bot.client.leaves == 0, "not before the grace has passed"
+
+    # Let the real grace elapse. Moving the clock back rather than shortening
+    # the constant keeps the shipped 30s in the test -- and `time.monotonic()`
+    # is far too coarse here to advance on its own between two frames.
+    bot._full_since -= bot.TABLE_START_GRACE_S + 1
+    _feed(bot, seats)
+
+    assert bot.client.leaves == 1
+
+
+def test_a_replacement_player_does_not_restart_the_clock():
+    """THE BUG this prevents: if the clock restarted every time somebody left
+    and was replaced, a table churning one seat would never time out at all."""
+    bot = _bot()
+    _feed(bot, _lobby(["a", PARTNER, "c", ME]))      # full: clock starts
+    armed = bot._full_since
+    assert armed is not None
+
+    _feed(bot, _lobby(["a", PARTNER, None, ME]))     # someone leaves
+    _feed(bot, _lobby(["a", PARTNER, "d", ME]))      # someone else sits down
+
+    assert bot._full_since == armed, "the clock was restarted"
+
+
+def test_the_clock_starts_again_at_a_new_table():
+    """The grace is per table: a fresh one must not inherit the last one's
+    clock and be abandoned the moment it fills."""
+    bot = _bot()
+    _feed(bot, _lobby(["a", PARTNER, "c", ME]))
+    assert bot._full_since is not None
+
+    bot.client.sessions_played += 1                  # the bridge joined another
+    _feed(bot, _lobby(["a", PARTNER, None, ME]))     # this one is not full yet
+
+    assert bot._full_since is None, "the new table inherited the old clock"
+
+
+def test_abandoning_tables_is_capped():
+    """A persistent problem must not become an endless create-and-delete loop:
+    every deletion ejects three people."""
+    bot = _bot()
+    for _ in range(LiveBelotBot.MAX_RECREATES + 3):
+        bot.client.sessions_played += 1              # a fresh table each time
+        _feed(bot, _lobby(["a", "b", "c", ME]))
+
+    assert bot.client.leaves == LiveBelotBot.MAX_RECREATES == 5
+
+
+def test_a_table_that_dealt_a_hand_is_never_abandoned():
+    """Once cards are out, the table has proved itself -- and leaving would
+    abandon a match in progress."""
+    bot = _bot()
+    bot.TABLE_START_GRACE_S = 0.0
+    # A first frame, so the bot settles on this table: joining one resets the
+    # per-table state, which would otherwise clear the flag set below.
+    _feed(bot, _lobby(["a", None, None, ME]))
+    bot._table_started = True
+
+    _feed(bot, _lobby(["a", "b", "c", ME]), times=5)
+    assert bot.client.leaves == 0
+
+
 # ----------------------------------------------------- the rotation probe
 #
 # CHANGE_PLAYERS_POSITION is the only message we send whose payload and effect
@@ -316,18 +430,18 @@ def test_the_count_agrees_with_applying_the_rule():
         assert current[2] == "partner", f"from seat {partner_seat}"
 
 
-def test_a_table_that_will_not_come_right_is_left_alone(capsys):
+def test_a_table_that_will_not_come_right_is_abandoned(capsys):
     """Two rotations always suffice. A third means the rule no longer holds,
     and shuffling a table full of people on a broken assumption is worse than
-    stopping: every rotation ejects the other three players."""
+    walking away and making another one."""
     bot = _bot()
     bot.ROTATE_RETRY_S = 0.0
     client = _feed(bot, _lobby(["a", "b", PARTNER, ME]), times=40)
 
     assert client.rotations == LiveBelotBot.MAX_ROTATIONS == 3
+    assert client.leaves == 1, "abandon it rather than keep shuffling"
     assert client.readies == 0, "must not start a mis-seated match either"
-    out = capsys.readouterr().out
-    assert "not behaving as measured" in out
+    assert "should be impossible" in capsys.readouterr().out
 
 
 # ------------------------------------------------------------------ logging

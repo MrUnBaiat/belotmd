@@ -68,6 +68,10 @@ class BelotClient:
         self._consumer = None
         self._phase = NOT_STARTED
         self._in_room = False
+        # Set while a LEAVE_TABLE of our own is in flight. "We asked to leave"
+        # normally ends the session; when we left in order to make a better
+        # table, it must not.
+        self._leaving_to_restart = False
 
     # How long to wait for `node bridge.js` to bind its port.
     DAEMON_TIMEOUT_S = 15.0
@@ -256,7 +260,19 @@ class BelotClient:
                     code = msg.get("code")
                     label = LEAVE_NAMES.get(code, "UNKNOWN")
                     self._in_room = False
-                    action = leave_recovery(code)
+                    if self._leaving_to_restart:
+                        # We asked for this. The policy for a leave we
+                        # requested is to STOP -- correct when a person means
+                        # "I am done", fatal when the bot means "this table is
+                        # no good, make another". As the creator, leaving also
+                        # deletes the table, so the close can arrive as I_LEFT
+                        # or as TABLE_REMOVED; neither should end the run.
+                        self._leaving_to_restart = False
+                        action = RECOVER_SOON
+                        print(f"[SDK] left that table on purpose ({label}); "
+                              f"finding or making another.")
+                    else:
+                        action = leave_recovery(code)
 
                     if label == "UNKNOWN":
                         print(f"[SDK][WARN] unrecognised close code {code}; "
@@ -389,6 +405,17 @@ class BelotClient:
         TRUMP_CHOOSE, which both send a bare scalar; the server broadcasts
         SHOW_COMBINATION {"who": seat, "value": "<code>"} in response."""
         await self._send("SHOW_COMBINATION", value)
+
+    async def leave_table(self, restart: bool = True):
+        """Leave the table. **As its creator this DELETES it**, and everyone
+        sitting there is kicked.
+
+        `restart=True` marks the leave as deliberate and temporary, so the
+        close that follows is recovered from rather than treated as the end of
+        the session. Payload `{}`, matching PASS and SWAP_SEVEN.
+        """
+        self._leaving_to_restart = bool(restart)
+        await self._send("LEAVE_TABLE", {})
 
     async def change_players_position(self):
         """Ask the table to move the other players around.
