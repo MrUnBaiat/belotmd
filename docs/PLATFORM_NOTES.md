@@ -633,6 +633,12 @@ them, so report the two separately.
 Everything here is **[CONFIRMED 2026-09-16]** from the site's own traffic, except
 where marked otherwise. This is what lets two of our accounts meet at one table.
 
+The create → find → join → sit-down path was then **exercised live** on the same
+day: one account created a table, the other found it in the lobby by the creator's
+username and took a seat in the same room, and the two played a match as partners
+against two humans. Only the seat rotation below is still unproven — the guest
+happened to land opposite the host, so it was never needed.
+
 ### The lobby
 
 `POST https://belot.md/gameTables.php` with `getMeseNew=1&nrJucatori=4&minStatus=0`
@@ -665,10 +671,18 @@ createNewTable=1&gametable_type=4&gametable_level=0&miza=50&gametable_color=1&ga
   `14puncte` is the 14-point rule, `gametable_color` is cosmetic, and
   **`gametable_level` is the minimum rating required to join** — 0 lets anyone in.
   `miza` has no confirmed meaning.
+- **The request MUST be sent as `application/x-www-form-urlencoded`.** This is not a
+  formality: with any other content type PHP parses no fields, and the server answers
+  **HTTP 200 with a zero-byte body, having created nothing** — no error, no redirect,
+  no clue. (Sending the body as a string through `fetch` labels it `text/plain`,
+  which is exactly how this was discovered.) The lobby call escapes this only because
+  `URLSearchParams` sets the header by itself.
 - The answer is **302 to `gameplay_new.php`**, and the creator **is already seated**
   in the new room. So creating needs no separate join: read that page and the four
   values in `window.customData` (`wsUrl`, `roomId`, `playerToken`, `playerId`) are
-  the ones the Colyseus join takes.
+  the ones the Colyseus join takes. Follow the redirect rather than handling it
+  manually — an unread `redirect: "manual"` response leaves a body nobody drains,
+  and the next request on that pooled connection stalls indefinitely.
 - **An account cannot create a table while it is seated at one.** Rejoining an
   active game must therefore be tried first — which is also how a reconnecting host
   gets back to its own table.
