@@ -2,7 +2,7 @@
 test_audit.py — the verification layer's own bookkeeping.
 """
 
-from belotmd.audit import Auditor
+from belotmd.audit import Auditor, FrameRecorder
 
 
 class _FakeSync:
@@ -25,6 +25,32 @@ def _frame(score_table, b=(10, 6)):
         "roundTotals": ('[{"p":100,"c":0,"b":%d},{"p":62,"c":0,"b":%d}]'
                         % (b[0], b[1])),
     }
+
+
+# --------------------------------------------------------- the recording
+def test_two_recorders_never_share_a_file(tmp_path, capsys):
+    """A recording is ONE player's view, `cards` included, and every tool that
+    reads one assumes that. Two accounts starting together used to land on the
+    same filename, and append mode let both write into it."""
+    path = tmp_path / "frames.jsonl"
+
+    first = FrameRecorder(str(path))
+    second = FrameRecorder(str(path))
+
+    assert first.path != second.path, "the second must not open the first's file"
+    assert second.path == str(tmp_path / "frames-1.jsonl")
+    assert "already exists" in capsys.readouterr().out, "and it must say so"
+
+    first.record({"currentPhase": 10}, "player-a")
+    second.record({"currentPhase": 10}, "player-b")
+    assert path.read_text(encoding="utf-8").count("\n") == 1, (
+        "one player's frames per file")
+
+
+def test_a_third_recorder_keeps_counting(tmp_path):
+    for expected in ("frames.jsonl", "frames-1.jsonl", "frames-2.jsonl"):
+        assert FrameRecorder(str(tmp_path / "frames.jsonl")).path == \
+            str(tmp_path / expected)
 
 
 def test_a_cleared_score_table_resets_the_row_counter():

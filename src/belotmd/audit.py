@@ -24,6 +24,7 @@ tools/frame_inspector.py.
 """
 
 import json
+import os
 import time
 import numpy as np
 
@@ -34,8 +35,31 @@ from .platform.sync import _bolt_marker, _last_cards_str, _to_int
 
 
 class FrameRecorder:
+    """Appends every frame the bot is given, one JSON object per line.
+
+    A recording holds ONE player's view, `cards` included, and every tool that
+    reads it assumes that. Two bots sharing a path -- two accounts started in
+    the same second, say -- would interleave two hands into one file, so a
+    recorder never opens a file that already exists: it takes the next free
+    name and says so.
+    """
+
     def __init__(self, path="frames.jsonl"):
-        self._f = open(path, "a", buffering=1, encoding="utf-8")
+        self.path = self._free_path(path)
+        if self.path != path:
+            print(f"[Audit] {path} already exists; recording to {self.path} "
+                  f"instead -- one recording holds one player's view.")
+        self._f = open(self.path, "x", buffering=1, encoding="utf-8")
+
+    @staticmethod
+    def _free_path(path):
+        if not os.path.exists(path):
+            return path
+        stem, ext = os.path.splitext(path)
+        n = 1
+        while os.path.exists(f"{stem}-{n}{ext}"):
+            n += 1
+        return f"{stem}-{n}{ext}"
 
     def record(self, raw_state, my_player_id):
         self._f.write(json.dumps(
