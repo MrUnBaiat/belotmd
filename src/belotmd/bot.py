@@ -69,11 +69,13 @@ class LiveBelotBot:
     partner = None
     is_host = False
     rotation_probe = 0
+    leave_probe = 0
     # Counted across tables. Class-level so that a bot built any other way than
-    # through __init__ still has them; both are immutable, and __init__ gives
+    # through __init__ still has them; all are immutable, and __init__ gives
     # every real instance its own.
     _recreates = 0
     _recreate_capped = False
+    _leave_probes_done = 0
 
     def __init__(self, config: Config = None, agent=None, agent_kwargs=None):
         self.config = config or Config.from_env()
@@ -104,6 +106,11 @@ class LiveBelotBot:
         self.partner = (self.config.partner or "").strip().casefold() or None
         self.is_host = self.config.table_mode == "create"
         self.rotation_probe = int(getattr(self.config, "rotation_probe", 0) or 0)
+        self.leave_probe = int(getattr(self.config, "leave_probe", 0) or 0)
+        if self.leave_probe and self.is_host:
+            print(f"[Bot] LEAVE PROBE: will abandon the first "
+                  f"{self.leave_probe} table(s) on purpose once our partner "
+                  f"sits down, to prove the leave-and-recreate path.")
         if self.rotation_probe and self.is_host:
             print(f"[Bot] ROTATION PROBE: will rotate the seats "
                   f"{self.rotation_probe}x before playing, whatever the "
@@ -120,6 +127,7 @@ class LiveBelotBot:
         # actually dealt somewhere.
         self._recreates = 0
         self._recreate_capped = False
+        self._leave_probes_done = 0
 
         self._room_seq = 0
         self._reset_room_state()
@@ -410,6 +418,17 @@ class LiveBelotBot:
             self._full_since = now
 
         if self.is_host and not self._table_started:
+            # The deliberate experiment, before anything can go wrong on its
+            # own: our partner is here and nobody else is yet, so abandoning
+            # now proves the whole path -- leave, close, create again, guest
+            # finds the new table -- without ejecting a single stranger.
+            if (not self._leave_sent and partner_seat is not None
+                    and self._leave_probes_done < self.leave_probe):
+                self._leave_probes_done += 1
+                await self._recreate_table(
+                    f"LEAVE PROBE {self._leave_probes_done}/{self.leave_probe}: "
+                    f"abandoning this table on purpose")
+                return True
             if seated >= 4 and partner_seat is None:
                 # Every seat taken and none of them ours: this can never become
                 # the table we want, and we will not spend a rated hand on a

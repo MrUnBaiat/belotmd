@@ -42,7 +42,7 @@ class StubClient:
         self.leaves += 1
 
 
-def _bot(partner=PARTNER, table_mode="create", rotation_probe=0):
+def _bot(partner=PARTNER, table_mode="create", rotation_probe=0, leave_probe=0):
     """A real bot, real state machine, no network."""
     from belotmd.agents import get_agent
     from belotmd.platform.sync import StateSynchronizer
@@ -50,7 +50,7 @@ def _bot(partner=PARTNER, table_mode="create", rotation_probe=0):
     bot = LiveBelotBot.__new__(LiveBelotBot)
     bot.config = Config(cookies="x", audit=False, agent="random",
                         partner=partner or "", table_mode=table_mode,
-                        rotation_probe=rotation_probe)
+                        rotation_probe=rotation_probe, leave_probe=leave_probe)
     bot.client = StubClient()
     bot.sync_engine = StateSynchronizer()
     bot.agent = get_agent("random", seed=0)
@@ -59,6 +59,10 @@ def _bot(partner=PARTNER, table_mode="create", rotation_probe=0):
     bot.partner = (partner or "").strip().casefold() or None
     bot.is_host = table_mode == "create"
     bot.rotation_probe = rotation_probe
+    bot.leave_probe = leave_probe
+    bot._leave_probes_done = 0
+    bot._recreates = 0
+    bot._recreate_capped = False
     bot._reset_room_state()
     bot.ROTATE_PROBE_GAP_S = 0.0          # no waiting between probe rotations
     return bot
@@ -294,6 +298,63 @@ def test_a_table_that_dealt_a_hand_is_never_abandoned():
 
     _feed(bot, _lobby(["a", "b", "c", ME]), times=5)
     assert bot.client.leaves == 0
+
+
+# -------------------------------------------------------- the leave probe
+#
+# Abandoning a table is the one path that cannot be rehearsed against a real
+# platform without consequences -- it ejects whoever is sitting there. Firing
+# it deliberately the moment our partner sits, and before any stranger has
+# joined, proves the whole sequence (leave, close, create again, guest finds
+# the new table) at nobody's expense.
+
+def test_the_leave_probe_abandons_the_first_table_once_our_partner_sits():
+    bot = _bot(leave_probe=1)
+    client = _feed(bot, _lobby([None, PARTNER, None, ME]))
+
+    assert client.leaves == 1
+    assert client.readies == 0, "no point announcing ourselves on the way out"
+
+
+def test_the_leave_probe_ejects_nobody():
+    """It must fire while only the two of us are seated."""
+    bot = _bot(leave_probe=1)
+    seats = _lobby([None, PARTNER, None, ME])
+    occupied = sum(1 for p in seats["players"] if p.get("id"))
+
+    _feed(bot, seats)
+
+    assert occupied == 2, "the fixture must have no strangers in it"
+    assert bot.client.leaves == 1
+
+
+def test_the_leave_probe_fires_once_per_table():
+    client = _feed(_bot(leave_probe=1), _lobby([None, PARTNER, None, ME]),
+                   times=5)
+    assert client.leaves == 1
+
+
+def test_the_leave_probe_stops_after_its_count():
+    bot = _bot(leave_probe=2)
+    for _ in range(5):
+        bot.client.sessions_played += 1          # a fresh table each time
+        _feed(bot, _lobby([None, PARTNER, None, ME]))
+
+    assert bot.client.leaves == 2, "two probes, then behave normally"
+
+
+def test_the_guest_never_runs_the_leave_probe():
+    bot = _bot(table_mode="join", leave_probe=1)
+    _feed(bot, _lobby([None, PARTNER, None, ME]))
+    assert bot.client.leaves == 0
+
+
+def test_a_bot_playing_alone_ignores_the_leave_probe():
+    """The single-agent path stays exactly as it was, probe flag or not."""
+    bot = _bot(partner=None, table_mode="create", leave_probe=1)
+    _feed(bot, _lobby(["a", "b", None, ME]))
+    assert bot.client.leaves == 0
+    assert bot.client.readies == 1
 
 
 # ----------------------------------------------------- the rotation probe

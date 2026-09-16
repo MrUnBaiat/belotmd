@@ -117,6 +117,11 @@ class Config:
     # table where the seats happen to be correct never exercises it. 0 = off.
     rotation_probe: int = 0
 
+    # Diagnostic: abandon this many tables on purpose, as soon as our partner
+    # has sat down and before any stranger joins, to prove the
+    # leave-and-make-another path works without ejecting anyone. 0 = off.
+    leave_probe: int = 0
+
     # --- staying on a table ---
     # Keep looking for tables instead of exiting after one session. A match
     # ending dissolves the table (TABLE_REMOVED), so without this the bot
@@ -176,6 +181,7 @@ class Config:
             table_creator=lookup.get("BELOT_TABLE_CREATOR", ""),
             partner=lookup.get("BELOT_PARTNER", ""),
             rotation_probe=int(lookup.get("BELOT_ROTATION_PROBE", 0) or 0),
+            leave_probe=int(lookup.get("BELOT_LEAVE_PROBE", 0) or 0),
             reconnect=_flag(lookup, "BELOT_RECONNECT", True),
             retry_delay_s=float(lookup.get("BELOT_RETRY_DELAY", 300)),
             rejoin_delay_s=float(lookup.get("BELOT_REJOIN_DELAY", 5)),
