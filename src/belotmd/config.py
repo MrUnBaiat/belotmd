@@ -15,16 +15,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = PROJECT_ROOT / ".env"
 
 
-def _load_env_file(path=ENV_FILE):
+def _read_env_file(path):
     """Minimal KEY=VALUE parser, so `.env` support costs no dependency.
 
-    The process environment always wins, so `BELOT_AUDIT=0 belot-bot` behaves
-    as expected regardless of what the file says. Values are taken verbatim
-    after the first `=` — belot cookies contain `=` and `;`, so no splitting
-    or unquoting beyond stripping one matched pair of surrounding quotes.
+    Returns a dict and touches nothing global. Values are taken verbatim after
+    the first `=` — belot cookies contain `=` and `;`, so no splitting or
+    unquoting beyond stripping one matched pair of surrounding quotes.
     """
+    values = {}
+    path = Path(path)
     if not path.exists():
-        return
+        return values
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -33,11 +34,24 @@ def _load_env_file(path=ENV_FILE):
         key, value = key.strip(), value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _load_env_file(path=ENV_FILE):
+    """Fold the default `.env` into the environment, which always wins — so
+    `BELOT_AUDIT=0 belot-bot` behaves as expected regardless of the file.
+
+    Only for the single-account path. Two accounts in one process cannot use
+    it: `setdefault` means whichever ran first keeps its cookies, and the
+    second silently plays as the first. That is what `env_file` below is for.
+    """
+    for key, value in _read_env_file(path).items():
         os.environ.setdefault(key, value)
 
 
-def _flag(name, default):
-    return os.environ.get(name, "1" if default else "0") == "1"
+def _flag(lookup, name, default):
+    return lookup.get(name, "1" if default else "0") == "1"
 
 
 @dataclass
@@ -101,24 +115,45 @@ class Config:
 
     warnings: list = field(default_factory=list)
 
+    # Which file the credentials came from, for error messages. Empty means
+    # the default `.env` + environment path.
+    env_file: str = ""
+
     @classmethod
-    def from_env(cls, **overrides):
-        """Build from the environment + `.env`, then apply CLI overrides."""
-        _load_env_file()
+    def from_env(cls, env_file=None, **overrides):
+        """Build from the environment + `.env`, then apply CLI overrides.
+
+        `env_file` names ONE account's file and is what makes two accounts
+        safe. Its credentials come from that file and nowhere else: a
+        `BELOT_COOKIES` left in the shell cannot decide which account a
+        process plays as, and nothing is written into `os.environ`, so a
+        second call with a different file is unaffected by the first. Other
+        knobs still fall back to the environment.
+        """
+        if env_file is None:
+            _load_env_file()
+            lookup = dict(os.environ)
+            cookies = lookup.get("BELOT_COOKIES", "").strip()
+        else:
+            from_file = _read_env_file(env_file)
+            lookup = {**os.environ, **from_file}
+            cookies = from_file.get("BELOT_COOKIES", "").strip()
+
         cfg = cls(
-            cookies=os.environ.get("BELOT_COOKIES", "").strip(),
-            audit=_flag("BELOT_AUDIT", True),
-            frames_path=os.environ.get("BELOT_FRAMES", "frames.jsonl"),
-            auto_declare=_flag("BELOT_AUTO_DECLARE", True),
-            declare_four_sevens=_flag("BELOT_DECLARE_FOUR_SEVENS", True),
-            declare_four_eights=_flag("BELOT_DECLARE_FOUR_EIGHTS", False),
-            declare_win_all=_flag("BELOT_DECLARE_WIN_ALL", False),
-            auto_swap_seven=_flag("BELOT_AUTO_SWAP_SEVEN", True),
-            agent=os.environ.get("BELOT_AGENT", "random"),
-            checkpoint=os.environ.get("BELOT_CHECKPOINT", ""),
-            reconnect=_flag("BELOT_RECONNECT", True),
-            retry_delay_s=float(os.environ.get("BELOT_RETRY_DELAY", 300)),
-            rejoin_delay_s=float(os.environ.get("BELOT_REJOIN_DELAY", 5)),
+            cookies=cookies,
+            audit=_flag(lookup, "BELOT_AUDIT", True),
+            frames_path=lookup.get("BELOT_FRAMES", "frames.jsonl"),
+            auto_declare=_flag(lookup, "BELOT_AUTO_DECLARE", True),
+            declare_four_sevens=_flag(lookup, "BELOT_DECLARE_FOUR_SEVENS", True),
+            declare_four_eights=_flag(lookup, "BELOT_DECLARE_FOUR_EIGHTS", False),
+            declare_win_all=_flag(lookup, "BELOT_DECLARE_WIN_ALL", False),
+            auto_swap_seven=_flag(lookup, "BELOT_AUTO_SWAP_SEVEN", True),
+            agent=lookup.get("BELOT_AGENT", "random"),
+            checkpoint=lookup.get("BELOT_CHECKPOINT", ""),
+            reconnect=_flag(lookup, "BELOT_RECONNECT", True),
+            retry_delay_s=float(lookup.get("BELOT_RETRY_DELAY", 300)),
+            rejoin_delay_s=float(lookup.get("BELOT_REJOIN_DELAY", 5)),
+            env_file=str(env_file or ""),
         )
         for key, value in overrides.items():
             if value is not None:
@@ -128,9 +163,10 @@ class Config:
     def require_cookies(self):
         """Fail loudly and usefully rather than joining as nobody."""
         if not self.cookies:
+            where = self.env_file or ENV_FILE
             raise SystemExit(
-                "BELOT_COOKIES is not set.\n\n"
-                f"  cp .env.example .env      (looked in {ENV_FILE})\n"
+                f"BELOT_COOKIES is not set (looked in {where}).\n\n"
+                "  cp .env.example .env\n"
                 "  then paste your belot.md PHPSESSID and token into it.\n\n"
                 "Get them from a logged-in browser: DevTools -> Application "
                 "-> Cookies -> https://belot.md"
