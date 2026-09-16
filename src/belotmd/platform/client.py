@@ -64,6 +64,10 @@ class BelotClient:
         self.join_max_polls = int(join_max_polls)
         self.pair_restart_pause_s = float(pair_restart_pause_s)
         self._join_polls = 0
+        # The table we last sat at, and a note to go straight back to it
+        # rather than asking the lobby (see the LEAVE handler).
+        self._last_table_id = None
+        self._rejoin_hint = None
         self.reconnect = reconnect
         self.retry_delay_s = float(retry_delay_s)
         self.rejoin_delay_s = float(rejoin_delay_s)
@@ -299,6 +303,14 @@ class BelotClient:
                     label = LEAVE_NAMES.get(code, "UNKNOWN")
                     self._in_room = False
                     restart_pause = None
+                    if code == LEAVE_POSITION_CHANGED and self._last_table_id:
+                        # The host rotated the seats. Nobody was removed: the
+                        # platform still has us at this table, so go back to it
+                        # directly. Asking the lobby reads our own seat as
+                        # taken, and a guest that stands down from its own
+                        # table leaves the host holding READY until it deletes
+                        # a table that was perfectly good.
+                        self._rejoin_hint = self._last_table_id
                     if self._leaving_to_restart:
                         # We asked for this. The policy for a leave we
                         # requested is to STOP -- correct when a person means
@@ -360,6 +372,15 @@ class BelotClient:
         self._in_room = False
         self._phase = NOT_STARTED
 
+        if table_id is None and self._rejoin_hint:
+            # We were moved off our seat, not off the table. The lobby would
+            # report that table as full -- our own seat is one of the taken
+            # ones -- and we would stand down from a table that is ours. Ask
+            # for it directly instead: the bridge rejoins whatever room the
+            # platform still has us in before it looks at this id at all.
+            table_id = self._rejoin_hint
+            self._rejoin_hint = None
+
         if self.table_mode == "join" and table_id is None:
             await ws.send(json.dumps({"action": "LOBBY",
                                       "cookies": self.cookies}))
@@ -371,6 +392,7 @@ class BelotClient:
             request["table"] = {"mode": "create", "body": CREATE_TABLE_BODY}
         elif self.table_mode == "join":
             request["table"] = {"mode": "join", "tableId": table_id}
+            self._last_table_id = table_id
         await ws.send(json.dumps(request))
 
     async def _recover(self, ws, action, reason, avoid_last=False, delay=None):

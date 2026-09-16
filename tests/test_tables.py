@@ -304,6 +304,43 @@ def test_the_poll_settings_reach_the_client():
     assert bot.client.pair_restart_pause_s == 11.0
 
 
+def test_a_rotated_guest_goes_straight_back_to_its_table():
+    """THE BUG, seen live: the host rotates the seats, the guest is dropped
+    (4005) and asks the lobby -- which reports the table FULL, because its own
+    seat is one of the taken ones. The guest then stood down from its own
+    table, and the host deleted a correctly seated table 30s later."""
+    from belotmd.platform.protocol import LEAVE_POSITION_CHANGED
+
+    bridge, _ = _drive(
+        [{"event": "LOBBY", "mese": [OURS]},
+         {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+         {"event": "LEAVE", "code": LEAVE_POSITION_CHANGED}],
+        table_mode="join", table_creator=HOST)
+
+    joins = bridge.of("CONNECT")
+    assert len(joins) == 2, "it must ask for the table again"
+    assert joins[1]["table"] == {"mode": "join", "tableId": "new-44709391"}
+    assert len(bridge.of("LOBBY")) == 1, (
+        "asking the lobby again is what went wrong -- our own seat reads as "
+        "taken")
+
+
+def test_the_rejoin_note_is_used_once():
+    """A later drop for some other reason must go back through the lobby."""
+    from belotmd.platform.protocol import (LEAVE_POSITION_CHANGED,
+                                           LEAVE_TABLE_REMOVED)
+
+    bridge, _ = _drive(
+        [{"event": "LOBBY", "mese": [OURS]},
+         {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+         {"event": "LEAVE", "code": LEAVE_POSITION_CHANGED},
+         {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+         {"event": "LEAVE", "code": LEAVE_TABLE_REMOVED}],
+        table_mode="join", table_creator=HOST)
+
+    assert len(bridge.of("LOBBY")) == 2, "the table is gone; look for it again"
+
+
 def test_the_guest_does_not_squeeze_into_a_full_table():
     bridge, _ = _drive([{"event": "LOBBY", "mese": [FULL]}],
                        table_mode="join", table_id="new-44711111")
