@@ -46,12 +46,16 @@ class LiveBelotBot:
     # shuffling the table forever.
     ROTATE_RETRY_S = 3.0
     MAX_ROTATIONS = 6
+    # A probe rotation drops the other three players, who then rejoin, so the
+    # experiment needs a wider gap than the ordinary fix-the-seats path.
+    ROTATE_PROBE_GAP_S = 8.0
 
     # Class-level defaults, so a bot built any other way than through
     # __init__ -- the tests construct one with __new__ -- is simply a bot
     # playing alone, rather than an AttributeError on the first frame.
     partner = None
     is_host = False
+    rotation_probe = 0
 
     def __init__(self, config: Config = None, agent=None, agent_kwargs=None):
         self.config = config or Config.from_env()
@@ -81,6 +85,11 @@ class LiveBelotBot:
         # Only the creator can move players between seats.
         self.partner = (self.config.partner or "").strip().casefold() or None
         self.is_host = self.config.table_mode == "create"
+        self.rotation_probe = int(getattr(self.config, "rotation_probe", 0) or 0)
+        if self.rotation_probe:
+            print(f"[Bot] ROTATION PROBE: will rotate the seats "
+                  f"{self.rotation_probe}x before playing, whatever the "
+                  f"layout, and log what moves.")
         if self.partner:
             print(f"[Bot] Paired run: holding READY until our partner sits "
                   f"opposite ({'host' if self.is_host else 'guest'}).")
@@ -145,6 +154,8 @@ class LiveBelotBot:
         self._rotations = 0           # seat rotations sent at THIS table
         self._rotate_ts = 0.0         # last one, for the debounce
         self._seat_map = None         # last seat layout we reported
+        self._probe_done = 0          # probe rotations sent at THIS table
+        self._seat_labels = {}        # player id -> a letter, per table
 
     def _check_room_change(self):
         """Notice that the client joined a different table and start clean."""
@@ -231,7 +242,7 @@ class LiveBelotBot:
             # ourselves. The match starts the moment all four players are
             # ready, so a READY sent at the wrong moment is what puts our two
             # accounts on opposite teams -- and nobody can start without us.
-            if self._seats_are_wrong(raw_state, my_pos):
+            if self._seats_are_wrong(raw_state, my_pos) or self._probe_pending(raw_state):
                 await self._fix_seats(raw_state, my_pos)
                 return
             if not self._server_says_ready(raw_state, my_pos):
@@ -302,34 +313,78 @@ class LiveBelotBot:
             return False
         return self._partner_seat(raw_state) != (my_pos + 2) % 4
 
+    def _seat_layout(self, players, my_pos, partner_seat):
+        """Who sits where, named so that MOVEMENT is visible but people are not.
+
+        Our two accounts appear by role; everyone else gets a letter, kept
+        stable for as long as we are at this table. That is enough to see a
+        rotation happen -- `1=A 3=B` becoming `1=B 3=A` -- without ever writing
+        down another player's name or id.
+        """
+        layout = []
+        for seat in range(4):
+            if seat == my_pos:
+                layout.append("us")
+            elif seat == partner_seat:
+                layout.append("partner")
+            elif seat < len(players) and players[seat].get("id"):
+                pid = str(players[seat]["id"])
+                if pid not in self._seat_labels:
+                    self._seat_labels[pid] = chr(ord("A") + len(self._seat_labels))
+                layout.append(self._seat_labels[pid])
+            else:
+                layout.append("empty")
+        return tuple(layout)
+
+    def _probe_pending(self, raw_state):
+        """Is a deliberate rotation experiment still owed?
+
+        `CHANGE_PLAYERS_POSITION` is the only message we send whose payload and
+        effect are unverified, and a table where the seats come out right by
+        luck never exercises it. The probe rotates anyway -- correct layout or
+        not -- so that what the message does becomes a matter of record.
+        """
+        return (self.is_host and self._probe_done < self.rotation_probe
+                and self._partner_seat(raw_state) is not None)
+
     async def _fix_seats(self, raw_state, my_pos):
         """Hold READY, and -- if we made this table -- rotate the seats.
 
-        Rotation is the creator's to do, so the guest simply waits. Both log
-        the layout, by ROLE rather than by name: which seats are ours is the
-        whole question, and the strangers at the table are nobody's business.
+        Rotation is the creator's to do, so the guest simply waits.
         """
         players = raw_state.get("players") or []
         partner_seat = self._partner_seat(raw_state)
         seated = sum(1 for p in players if p.get("id"))
 
-        layout = tuple("us" if s == my_pos else
-                       "partner" if s == partner_seat else
-                       "other" if s < len(players) and players[s].get("id")
-                       else "empty" for s in range(4))
+        layout = self._seat_layout(players, my_pos, partner_seat)
         if layout != self._seat_map:
             self._seat_map = layout
-            print(f"[Bot] seats {' '.join(f'{s}={r}' for s, r in enumerate(layout))}"
-                  f" -- holding READY until our partner sits at seat "
-                  f"{(my_pos + 2) % 4}.")
+            where = " ".join(f"{s}={r}" for s, r in enumerate(layout))
+            print(f"[Bot] seats {where} -- holding READY (our partner belongs "
+                  f"at seat {(my_pos + 2) % 4}).")
 
-        if not self.is_host or partner_seat is None or seated < 4:
+        if not self.is_host or partner_seat is None:
+            return
+
+        now = time.monotonic()
+
+        # The experiment comes first, and ignores whether the seats are right.
+        if self._probe_done < self.rotation_probe:
+            if now - self._rotate_ts < self.ROTATE_PROBE_GAP_S:
+                return
+            self._rotate_ts = now
+            self._probe_done += 1
+            where = " ".join(f"{s}={r}" for s, r in enumerate(layout))
+            print(f"[Bot][PROBE] rotation {self._probe_done}/"
+                  f"{self.rotation_probe} sent, from {where} -- the next "
+                  f"'seats' line is what it did.")
+            await self.client.change_players_position()
+            return
+
+        if seated < 4 or self._rotations >= self.MAX_ROTATIONS:
             # Nothing to rotate yet: an empty seat will be filled by whoever
             # sits down next, and that changes the arrangement anyway.
             return
-        if self._rotations >= self.MAX_ROTATIONS:
-            return
-        now = time.monotonic()
         if now - self._rotate_ts < self.ROTATE_RETRY_S:
             return
 

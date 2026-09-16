@@ -38,14 +38,15 @@ class StubClient:
         self.rotations += 1
 
 
-def _bot(partner=PARTNER, table_mode="create"):
+def _bot(partner=PARTNER, table_mode="create", rotation_probe=0):
     """A real bot, real state machine, no network."""
     from belotmd.agents import get_agent
     from belotmd.platform.sync import StateSynchronizer
 
     bot = LiveBelotBot.__new__(LiveBelotBot)
     bot.config = Config(cookies="x", audit=False, agent="random",
-                        partner=partner or "", table_mode=table_mode)
+                        partner=partner or "", table_mode=table_mode,
+                        rotation_probe=rotation_probe)
     bot.client = StubClient()
     bot.sync_engine = StateSynchronizer()
     bot.agent = get_agent("random", seed=0)
@@ -53,7 +54,9 @@ def _bot(partner=PARTNER, table_mode="create"):
     bot._room_seq = 0
     bot.partner = (partner or "").strip().casefold() or None
     bot.is_host = table_mode == "create"
+    bot.rotation_probe = rotation_probe
     bot._reset_room_state()
+    bot.ROTATE_PROBE_GAP_S = 0.0          # no waiting between probe rotations
     return bot
 
 
@@ -177,6 +180,83 @@ def test_a_new_table_starts_its_rotation_count_again():
     bot.ROTATE_RETRY_S = 0.0
     _feed(bot, _lobby(["a", "b", PARTNER, ME]))
     assert bot.client.rotations == LiveBelotBot.MAX_ROTATIONS + 1
+
+
+# ----------------------------------------------------- the rotation probe
+#
+# CHANGE_PLAYERS_POSITION is the only message we send whose payload and effect
+# are unverified. A table where the seats come out right by luck never
+# exercises it, so the probe rotates deliberately and logs what moved.
+
+def test_the_probe_rotates_even_when_the_seats_are_already_right():
+    """The point of the experiment: without this, a correct layout means the
+    message is never sent and we learn nothing."""
+    bot = _bot(rotation_probe=4)
+    client = _feed(bot, _lobby(["a", PARTNER, "c", ME]), times=50)
+
+    assert client.rotations == 4, "exactly the requested number, then stop"
+    assert bot._probe_done == 4
+
+
+def test_the_probe_holds_ready_until_it_has_finished():
+    """A match starting mid-experiment would end it early and seat us at
+    whatever the last rotation happened to produce."""
+    bot = _bot(rotation_probe=4)
+    client = _feed(bot, _lobby(["a", PARTNER, "c", ME]), times=2)
+
+    assert client.rotations == 2 and client.readies == 0
+
+
+def test_play_resumes_normally_once_the_probe_is_done():
+    client = _feed(_bot(rotation_probe=2), _lobby(["a", PARTNER, "c", ME]),
+                   times=50)
+    assert client.rotations == 2
+    assert client.readies == 1, "after the experiment, behave as usual"
+
+
+def test_the_guest_never_probes():
+    """Only the table's creator can move players around."""
+    client = _feed(_bot(table_mode="join", rotation_probe=4),
+                   _lobby(["a", PARTNER, "c", ME]), times=20)
+    assert client.rotations == 0
+
+
+def test_the_probe_waits_for_our_partner_to_arrive():
+    """With nobody of ours to watch move, a rotation tells us nothing."""
+    client = _feed(_bot(rotation_probe=4), _lobby(["a", "b", "c", ME]),
+                   times=20)
+    assert client.rotations == 0
+
+
+def test_the_probe_starts_over_at_a_new_table():
+    bot = _bot(rotation_probe=2)
+    _feed(bot, _lobby(["a", PARTNER, "c", ME]), times=20)
+    bot.client.sessions_played += 1                  # the bridge joined another
+    _feed(bot, _lobby(["a", PARTNER, "c", ME]), times=20)
+    assert bot.client.rotations == 4
+
+
+def test_the_probe_reports_movement_without_naming_anyone(capsys):
+    """The log has to show a seat CHANGING occupant, which needs identity --
+    so strangers get stable letters instead of names."""
+    bot = _bot(rotation_probe=1)
+    _feed(bot, _lobby(["StrangerOne", PARTNER, "StrangerTwo", ME]))
+    out = capsys.readouterr().out
+
+    assert "PROBE" in out and "rotation 1/1" in out
+    assert "0=A" in out and "2=B" in out, "strangers appear as letters"
+    assert "1=partner" in out and "3=us" in out
+    assert "StrangerOne" not in out and "StrangerTwo" not in out
+    assert PARTNER not in out
+
+
+def test_a_stranger_keeps_the_same_letter_while_we_sit_there():
+    """Otherwise 'A moved from 0 to 1' would be unreadable."""
+    bot = _bot(rotation_probe=0)
+    _feed(bot, _lobby(["StrangerOne", "StrangerTwo", PARTNER, ME]))
+    first = dict(bot._seat_labels)
+    _feed(bot, _lobby(["StrangerOne", "StrangerTwo", PARTNER, ME]))
+    assert bot._seat_labels == first and len(first) == 2
 
 
 # ------------------------------------------------------------------ logging

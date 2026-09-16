@@ -111,6 +111,12 @@ class Config:
     # ready and a pair on opposite teams is the one outcome worth avoiding.
     partner: str = ""
 
+    # Diagnostic: rotate the seats this many times even when they are ALREADY
+    # right, logging the layout before and after each one. CHANGE_PLAYERS_POSITION
+    # is the one message we send whose payload and effect are unverified, and a
+    # table where the seats happen to be correct never exercises it. 0 = off.
+    rotation_probe: int = 0
+
     # --- staying on a table ---
     # Keep looking for tables instead of exiting after one session. A match
     # ending dissolves the table (TABLE_REMOVED), so without this the bot
@@ -169,6 +175,7 @@ class Config:
             table_id=lookup.get("BELOT_TABLE_ID", ""),
             table_creator=lookup.get("BELOT_TABLE_CREATOR", ""),
             partner=lookup.get("BELOT_PARTNER", ""),
+            rotation_probe=int(lookup.get("BELOT_ROTATION_PROBE", 0) or 0),
             reconnect=_flag(lookup, "BELOT_RECONNECT", True),
             retry_delay_s=float(lookup.get("BELOT_RETRY_DELAY", 300)),
             rejoin_delay_s=float(lookup.get("BELOT_REJOIN_DELAY", 5)),
