@@ -705,13 +705,37 @@ differs.
   and everyone is kicked. If the creator leaves mid-match, the platform bot takes
   its seat, exactly as for any other timed-out player (§10).
 
-### Seats **[UNCONFIRMED — the payload has not been decoded]**
+### Seats **[CONFIRMED live 2026-09-16, four rotations, predictions matched each time]**
 
-`CHANGE_PLAYERS_POSITION` exists and appears to **rotate the other three players
-clockwise while the sender stays put**, which would put a chosen partner opposite
-within at most two sends. The reply is Colyseus-encoded state, so the effect has to
-be read from the next STATE frame rather than from the response. The other players
-see close code 4005 (`POSITION_CHANGED`), which §3 already covers.
+`CHANGE_PLAYERS_POSITION` takes **an empty payload** (`{}`) and the server accepts it.
+The reply is Colyseus-encoded state, so the effect is read from the next STATE frame,
+never from the response.
+
+**The rule:** the sender stays where it is, and **every other seat's occupant moves
+one seat forward in index order**. With the sender at seat 0, `1 → 2`, `2 → 3`,
+`3 → 1`. Observed four times in a row, including the mixed cases:
+
+```
+0=us 1=A 2=B       3=partner  ->  0=us 1=partner 2=A 3=B
+0=us 1=partner 2=A 3=empty    ->  0=us 1=empty   2=partner 3=A
+0=us 1=C 2=partner 3=A        ->  0=us 1=A       2=C 3=partner
+0=us 1=A 2=C       3=partner  ->  0=us 1=partner 2=A 3=C
+```
+
+Consequences worth knowing:
+
+- **Empty seats take part.** The second line above moves the empty slot 3 → 1, so this
+  is a positional cycle over the three non-sender chairs, not a reshuffle of people.
+- **The period is 3, not 4.** Three rotations restore the original layout. So placing a
+  chosen partner opposite takes **at most two** sends, and the exact number is
+  computable rather than something to search for: with the other seats listed in index
+  order, it is `(target_index - partner_index) mod 3`.
+- **Everyone else is ejected and must rejoin** (close code 4005, `POSITION_CHANGED`,
+  §3). Our own guest recovers automatically, but **human players do not always come
+  back** — one left after the first rotation during this test. Rotate as few times as
+  possible.
+- Only the table's creator was tested as the sender. Whether a non-creator can send it
+  is still unknown.
 
 ---
 
