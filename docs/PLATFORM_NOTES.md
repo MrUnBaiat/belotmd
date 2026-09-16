@@ -628,6 +628,79 @@ them, so report the two separately.
 
 ---
 
+## 12. Tables: the lobby, creating one, and joining a chosen one
+
+Everything here is **[CONFIRMED 2026-09-16]** from the site's own traffic, except
+where marked otherwise. This is what lets two of our accounts meet at one table.
+
+### The lobby
+
+`POST https://belot.md/gameTables.php` with `getMeseNew=1&nrJucatori=4&minStatus=0`
+returns `{"mese": [...]}`. One entry, for a table one of our accounts created:
+
+```json
+{"id": "new-44709391", "regula_14": 1, "type": 4, "colors": 1, "masa": 101,
+ "players": "3", "time": 4, "pass": false, "creator": ["4", "<username>", "104325"],
+ "full": 0}
+```
+
+- `id` is a **string with a `new-` prefix**, passed to `enterGame` exactly as listed.
+  It is not a number.
+- `creator` is `[level, username, account id]`. That **account id is not the in-room
+  `playerId`**, so the username is the only field that can be matched against
+  something we configured — which is how the guest finds the host's table without
+  the two processes talking to each other.
+- `full: 0` means there is a free seat; `pass` is whether a password is required.
+
+### Creating a table
+
+`POST gameTables.php` with the form body **verbatim** (see
+`platform/tables.py:CREATE_TABLE_BODY`):
+
+```
+createNewTable=1&gametable_type=4&gametable_level=0&miza=50&gametable_color=1&gametable_points=101&14puncte=on&password=
+```
+
+- `gametable_type=4` is 2v2, `gametable_points` is the target (51/101/151),
+  `14puncte` is the 14-point rule, `gametable_color` is cosmetic, and
+  **`gametable_level` is the minimum rating required to join** — 0 lets anyone in.
+  `miza` has no confirmed meaning.
+- The answer is **302 to `gameplay_new.php`**, and the creator **is already seated**
+  in the new room. So creating needs no separate join: read that page and the four
+  values in `window.customData` (`wsUrl`, `roomId`, `playerToken`, `playerId`) are
+  the ones the Colyseus join takes.
+- **An account cannot create a table while it is seated at one.** Rejoining an
+  active game must therefore be tried first — which is also how a reconnecting host
+  gets back to its own table.
+- **A created table counts toward rating** exactly like any other.
+
+### Joining a chosen table
+
+`POST gameTables.php` with `enterGame=4&gameId=new-44709391&password=` answers
+`{"success":"gameplay_new.php"}`; that page then carries the joiner's own four
+values. This is the same call the lobby pick already used — only the `gameId`
+differs.
+
+### Starting, ending, and leaving
+
+- **The match starts when all four players are READY.** There is no host "start".
+- **A table survives its match.** Afterwards it stays open; if someone leaves it
+  waits for a replacement and for all four to be READY, then deals again. So
+  `TABLE_REMOVED` (4003) is not the normal end of a match for a table like this.
+- **If the creator leaves while players are still gathering, the table is removed**
+  and everyone is kicked. If the creator leaves mid-match, the platform bot takes
+  its seat, exactly as for any other timed-out player (§10).
+
+### Seats **[UNCONFIRMED — the payload has not been decoded]**
+
+`CHANGE_PLAYERS_POSITION` exists and appears to **rotate the other three players
+clockwise while the sender stays put**, which would put a chosen partner opposite
+within at most two sends. The reply is Colyseus-encoded state, so the effect has to
+be read from the next STATE frame rather than from the response. The other players
+see close code 4005 (`POSITION_CHANGED`), which §3 already covers.
+
+---
+
 ## 11. Still unverified
 
 1. **`trumpWasPlayed` semantics.** It resets per hand and flips mid-hand, but it
