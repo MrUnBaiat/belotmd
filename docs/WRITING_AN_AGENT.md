@@ -173,9 +173,20 @@ from belotmd import sample_determinization, Infeasible
 hands = sample_determinization(state, seat, rng)   # four card lists, by seat
 ```
 
-It places the most-constrained card first, because a naive shuffle-and-fill
-dead-ends surprisingly often once voids accumulate — and a dead-end quietly
-patched yields an *illegal* world, which is worse than no world at all.
+Every consistent deal is equally likely: it counts the completions exactly and
+draws uniformly among them, which is the right prior when hand sizes, pins and
+voids are all that is known. (It used to place cards greedily, weighting seats by
+remaining capacity. That is uniform only without voids; late in a hand it tilted
+individual card probabilities by up to 35 standard errors.) For many worlds per
+decision, build the sampler once:
+
+```python
+from belotmd import uniform_sampler
+
+sampler = uniform_sampler(state, seat)   # counts the worlds, once
+hands = sampler.draw(rng)                # then ~24 lookups per world
+```
+
 Genuinely contradictory constraints raise `Infeasible` rather than being
 guessed past.
 

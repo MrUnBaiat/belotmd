@@ -43,9 +43,9 @@ from .agents.base import Agent, available, get_agent, register
 from .config import Config
 from .game.actions import (ACTION_ACCEPT, ACTION_PASS, ACTION_SPACE_SIZE,
                            ACTION_SUIT_BASE, CARD_ACTIONS, SUIT_ACTIONS)
-from .game.belief import (Constraints, Infeasible, belief_matrix, can_hold,
-                          constraints, hand_sizes, sample_determinization,
-                          unseen_cards)
+from .game.belief import (Constraints, Infeasible, UniformSampler, belief_matrix,
+                          can_hold, constraints, hand_sizes, sample_determinization,
+                          uniform_sampler, unseen_cards)
 from .game.state import BelotState
 
 __version__ = "1.0.0"
@@ -55,7 +55,7 @@ __all__ = [
     "Agent", "register", "get_agent", "available",
     # game
     "BelotState", "belief_matrix", "unseen_cards", "can_hold",
-    "sample_determinization", "Infeasible",
+    "sample_determinization", "uniform_sampler", "UniformSampler", "Infeasible",
     "Constraints", "constraints", "hand_sizes",
     "ACTION_SPACE_SIZE", "CARD_ACTIONS", "ACTION_PASS", "ACTION_ACCEPT",
     "ACTION_SUIT_BASE", "SUIT_ACTIONS",

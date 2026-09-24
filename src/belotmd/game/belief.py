@@ -227,87 +227,125 @@ class Infeasible(RuntimeError):
     """No deal satisfies the constraints. See `sample_determinization`."""
 
 
-def sample_determinization(state, seat, rng=None, max_attempts=64):
-    """Sample one full deal consistent with everything `seat` can observe.
+class UniformSampler:
+    """Exactly uniform draws over EVERY deal consistent with the constraints.
 
-    This is deliberately **constraint satisfaction only** — it answers "is
-    this world legal", not "is this world likely". Returns a list of four card
-    lists indexed by seat; `seat`'s own entry is its real hand.
+    Given only hand sizes, pins and voids, every consistent completion of a
+    random deal is equally likely -- so that is the distribution a search that
+    samples worlds needs, and anything else tilts its view of where the cards
+    are. This counts the completions exactly and draws each one with equal
+    probability.
 
-    The division of labour with a search agent: this function hands you one
-    legal world, and how many you draw, how you weight them and what you do
-    with them stays yours. If you want a different sampling *distribution* —
-    importance-weighted by `belief_matrix`, say — build it on `unseen_cards`
-    and `can_hold` instead and use this as an oracle to check yours against.
+    The count is a small dynamic programme: pool cards are placed one at a
+    time, and the state is the three seats' remaining capacities -- at most 24
+    cards by 9 x 9 x 9 states, built once. A draw then places each card with
+    probability proportional to the number of completions that remain, which is
+    exactly uniform over whole deals, in ~24 table lookups.
 
-    Every constraint the synchronizer has established is honoured:
+    The capacity-weighted greedy this replaced was uniform only without voids.
+    Measured on real recorded positions at tricks 3-6 -- where voids are the
+    rule and where the search runs -- it put 8-9% of (card, seat) probabilities
+    more than 3 standard errors from the exact value (0.27% expected), some by
+    35 (research/v11 x32 in the BelotAgents repository).
+
+    Build one per decision and draw as many worlds as the clock allows;
+    `sample_determinization` builds one per call.
+    """
+
+    def __init__(self, cons):
+        self.cons = cons
+        self.others = cons.others
+        if any(cons.need(p) < 0 for p in self.others):
+            raise Infeasible(
+                f"a seat is pinned more cards than it holds: "
+                f"{ {p: (len(cons.pins.get(p, ())), cons.hand_sizes[p]) for p in self.others} }")
+        if not cons.is_consistent():
+            raise Infeasible(
+                f"{len(cons.pool)} unplaced cards but seats need "
+                f"{sum(cons.need(p) for p in self.others)}")
+        # Any order gives the same distribution; most-constrained first keeps
+        # the reachable capacity states few.
+        self.cards = tuple(sorted(cons.pool, key=lambda card: (len(cons.candidates(card)), card)))
+        self.allowed = tuple(
+            tuple(j for j, p in enumerate(self.others) if card not in cons.voids.get(p, ()))
+            for card in self.cards)
+        self.need = tuple(cons.need(p) for p in self.others)
+        self._memo = {}
+        self.worlds = self._count(0, self.need)
+        if not self.worlds:
+            raise Infeasible(
+                f"no deal satisfies the constraints for seat {cons.seat} "
+                f"(pool={len(cons.pool)}, need={dict(zip(self.others, self.need))}) "
+                f"-- they contradict each other, which points at a sync bug")
+
+    def _count(self, i, caps):
+        """Completions placing cards[i:] into seats with capacities `caps`."""
+        if i == len(self.cards):
+            return 1                  # capacities sum to the cards left: all zero
+        key = (i, caps)
+        hit = self._memo.get(key)
+        if hit is None:
+            hit = 0
+            for j in self.allowed[i]:
+                if caps[j]:
+                    hit += self._count(i + 1, caps[:j] + (caps[j] - 1,) + caps[j + 1:])
+            self._memo[key] = hit
+        return hit
+
+    def draw(self, rng):
+        """One deal, as four card lists indexed by seat; ours is our real hand."""
+        caps = self.need
+        deal = {p: list(self.cons.pins.get(p, ())) for p in self.others}
+        for i, card in enumerate(self.cards):
+            options = []
+            for j in self.allowed[i]:
+                if caps[j]:
+                    nxt = caps[:j] + (caps[j] - 1,) + caps[j + 1:]
+                    options.append((j, nxt, self._count(i + 1, nxt)))
+            r = int(rng.integers(sum(w for _, _, w in options)))
+            for j, nxt, w in options:
+                if r < w:
+                    break
+                r -= w
+            deal[self.others[j]].append(card)
+            caps = nxt
+        hands = [None] * 4
+        hands[self.cons.seat] = list(self.cons.own_hand)
+        for p in self.others:
+            hands[p] = sorted(deal[p])
+        return hands
+
+
+def uniform_sampler(state, seat):
+    """A `UniformSampler` over everything `seat` can observe. Build it once per
+    decision, then `draw(rng)` a world per determinization."""
+    return UniformSampler(constraints(state, seat))
+
+
+def sample_determinization(state, seat, rng=None, max_attempts=None):
+    """Sample one full deal consistent with everything `seat` can observe,
+    **uniformly** over all such deals.
+
+    Returns a list of four card lists indexed by seat; `seat`'s own entry is
+    its real hand. Every constraint the synchronizer has established is
+    honoured:
 
       * hand sizes match `numCards` as reported by the server;
       * a card in `known_cards[p]` always goes to p;
       * a card in `impossible_cards[p]` never goes to p;
       * played cards and our own cards are never dealt out.
 
-    Cards are placed most-constrained-first — the card with the fewest
-    remaining candidate seats goes next — because a naive shuffle-and-fill
-    dead-ends surprisingly often once voids accumulate late in a hand, and a
-    dead-end that is silently patched produces an *illegal* world, which is
-    worse than no world at all. Ties are broken randomly and candidate seats
-    are chosen with probability proportional to their remaining capacity, so
-    repeated calls explore the space rather than returning the same deal.
+    Each consistent deal is equally likely -- the right prior when all that is
+    known is those hard constraints -- see `UniformSampler`, which this builds
+    per call. Drawing many worlds for one decision, build a sampler once with
+    `uniform_sampler(state, seat)` instead. If you want a different
+    distribution -- weighted by what the opponents' play suggests, say -- build
+    it on `unseen_cards` and `can_hold`, and use this as the reference.
 
-    Raises `Infeasible` if no consistent deal is found in `max_attempts`
-    tries. That is a real signal, not a nuisance: it means the constraints
-    contradict each other, which points at a sync bug rather than bad luck.
+    Raises `Infeasible` when no deal satisfies the constraints. That is a real
+    signal, not a nuisance: they contradict each other, which points at a sync
+    bug rather than bad luck. `max_attempts` is accepted for compatibility and
+    ignored: the draw is exact, so it never retries.
     """
     rng = rng or np.random.default_rng()
-    c = constraints(state, seat)
-
-    if any(c.need(p) < 0 for p in c.others):
-        raise Infeasible(
-            f"a seat is pinned more cards than it holds: "
-            f"{ {p: (len(c.pins.get(p, ())), c.hand_sizes[p]) for p in c.others} }")
-    if not c.is_consistent():
-        raise Infeasible(
-            f"{len(c.pool)} unplaced cards but seats need "
-            f"{sum(c.need(p) for p in c.others)}")
-
-    for _ in range(max_attempts):
-        capacity = {p: c.need(p) for p in c.others}
-        deal = {p: list(c.pins.get(p, ())) for p in c.others}
-        remaining = list(c.pool)
-        rng.shuffle(remaining)
-        ok = True
-
-        while remaining:
-            # Recompute candidates each round: capacities shrink as we go.
-            best, best_options = None, None
-            for card in remaining:
-                options = [p for p in c.candidates(card) if capacity[p] > 0]
-                if not options:
-                    ok = False
-                    break
-                if best_options is None or len(options) < len(best_options):
-                    best, best_options = card, options
-                    if len(options) == 1:
-                        break            # cannot do better than forced
-            if not ok:
-                break
-
-            weights = np.array([capacity[p] for p in best_options], dtype=float)
-            chosen = int(rng.choice(best_options, p=weights / weights.sum()))
-            deal[chosen].append(best)
-            capacity[chosen] -= 1
-            remaining.remove(best)
-
-        if ok and all(v == 0 for v in capacity.values()):
-            hands = [None] * 4
-            hands[seat] = list(c.own_hand)
-            for p in c.others:
-                hands[p] = sorted(deal[p])
-            return hands
-
-    raise Infeasible(
-        f"no consistent deal for seat {seat} after {max_attempts} attempts "
-        f"(pool={len(c.pool)}, "
-        f"need={ {p: c.need(p) for p in c.others} }) -- the constraints may contradict"
-    )
+    return uniform_sampler(state, seat).draw(rng)

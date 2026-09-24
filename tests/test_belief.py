@@ -259,3 +259,119 @@ def test_check_rejects_a_violated_pin():
     with pytest.raises(Infeasible) as exc:
         c.check(hands)
     assert "provably holds" in str(exc.value)
+
+
+# ------------------------------------------------ uniformity: the prior a search needs
+# Given only hand sizes, pins and voids, every consistent completion of a random deal
+# is equally likely, so a search sampling worlds needs them drawn uniformly. The
+# capacity-weighted greedy the sampler used to be was uniform only without voids; on
+# real recorded positions it put 8-9% of (card, seat) probabilities beyond 3 standard
+# errors of the exact value.
+
+def _voided(cards_each=3):
+    """Nine unplaced cards and three voids that make the seats asymmetric."""
+    s = _mid_hand(cards_each)
+    s.impossible_cards[1, [3, 4, 5, 6]] = True
+    s.impossible_cards[3, [7, 8]] = True
+    s.impossible_cards[2, [11]] = True
+    return s
+
+
+def _every_deal(state, seat):
+    """Brute-force enumeration: the reference the sampler is held to."""
+    from itertools import combinations
+    from belotmd.game.belief import constraints
+    c = constraints(state, seat)
+    q0, q1, q2 = c.others
+    pool, out = list(c.pool), []
+    for a in combinations(pool, c.need(q0)):
+        if set(a) & set(c.voids.get(q0, ())):
+            continue
+        rest = [x for x in pool if x not in a]
+        for b in combinations(rest, c.need(q1)):
+            last = tuple(x for x in rest if x not in b)
+            if set(b) & set(c.voids.get(q1, ())) or set(last) & set(c.voids.get(q2, ())):
+                continue
+            hands = {q0: a, q1: b, q2: last}
+            out.append(tuple(tuple(sorted(set(hands[p]) | set(c.pins.get(p, ()))))
+                             for p in c.others))
+    return out
+
+
+def _capacity_greedy(state, seat, rng):
+    """The draw this replaced, kept here only as the uniformity test's negative
+    control: most-constrained card first, seat chosen by remaining capacity."""
+    from belotmd.game.belief import constraints
+    c = constraints(state, seat)
+    while True:
+        cap = {p: c.need(p) for p in c.others}
+        deal = {p: list(c.pins.get(p, ())) for p in c.others}
+        remaining = list(c.pool)
+        rng.shuffle(remaining)
+        ok = True
+        while remaining and ok:
+            best, opts = None, None
+            for card in remaining:
+                o = [p for p in c.candidates(card) if cap[p] > 0]
+                if not o:
+                    ok = False
+                    break
+                if opts is None or len(o) < len(opts):
+                    best, opts = card, o
+            if ok:
+                w = np.array([cap[p] for p in opts], dtype=float)
+                p = int(rng.choice(opts, p=w / w.sum()))
+                deal[p].append(best)
+                cap[p] -= 1
+                remaining.remove(best)
+        if ok:
+            hands = [None] * 4
+            hands[seat] = list(c.own_hand)
+            for p in c.others:
+                hands[p] = sorted(deal[p])
+            return hands
+
+
+def _chi2_vs_uniform(draw, state, seat, draws, seed):
+    worlds = _every_deal(state, seat)
+    index = {w: i for i, w in enumerate(worlds)}
+    others = [(seat + r) % 4 for r in (1, 2, 3)]
+    counts = np.zeros(len(worlds))
+    rng = np.random.default_rng(seed)
+    for _ in range(draws):
+        hands = draw(state, seat, rng)
+        k = tuple(tuple(sorted(hands[p])) for p in others)
+        assert k in index, "drew a deal outside the constraint set"
+        counts[index[k]] += 1
+    expected = draws / len(worlds)
+    chi2 = float(((counts - expected) ** 2 / expected).sum())
+    dof = len(worlds) - 1
+    return chi2, dof
+
+
+def test_the_sampler_counts_every_consistent_deal():
+    from belotmd.game.belief import uniform_sampler
+    for s in (_mid_hand(3), _voided(3), _voided(4)):
+        assert uniform_sampler(s, 0).worlds == len(_every_deal(s, 0))
+
+
+def test_determinization_is_uniform_over_consistent_deals():
+    from belotmd.game.belief import sample_determinization
+    chi2, dof = _chi2_vs_uniform(sample_determinization, _voided(), 0, 6_000, seed=11)
+    # chi2 has mean dof and sd sqrt(2 dof) under uniformity; allow 5 sd.
+    assert chi2 < dof + 5 * np.sqrt(2 * dof), f"chi2 {chi2:.0f} on {dof} dof"
+
+
+def test_the_uniformity_test_catches_the_old_greedy():
+    """Negative control: without it, a pass above would prove nothing."""
+    chi2, dof = _chi2_vs_uniform(_capacity_greedy, _voided(), 0, 6_000, seed=11)
+    assert chi2 > dof + 10 * np.sqrt(2 * dof), f"the old greedy looked uniform: {chi2:.0f}"
+
+
+def test_a_sampler_draws_many_worlds_from_one_build():
+    from belotmd.game.belief import uniform_sampler
+    s = _voided()
+    sampler = uniform_sampler(s, 0)
+    rng = np.random.default_rng(12)
+    for _ in range(200):
+        _assert_valid(s, 0, sampler.draw(rng))
