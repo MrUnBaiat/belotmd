@@ -11,12 +11,20 @@ export default [
         languageOptions: {
             ecmaVersion: 2022,
             sourceType: "module",
+            // Listed by hand rather than taken from a `globals` preset, so that
+            // a misspelled global is still an error. The cost is that using a
+            // new platform API in bridge.js means adding it here as well --
+            // `npm run lint` names the ones that are missing.
             globals: {
                 console: "readonly",
                 fetch: "readonly",
+                AbortSignal: "readonly",      // fetch deadlines: AbortSignal.timeout
                 setInterval: "readonly",
                 clearInterval: "readonly",
+                setTimeout: "readonly",
+                clearTimeout: "readonly",
                 URLSearchParams: "readonly",
+                URL: "readonly",
                 process: "readonly",
                 global: "readonly",
                 globalThis: "readonly",
