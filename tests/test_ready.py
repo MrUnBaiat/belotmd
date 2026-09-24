@@ -166,3 +166,31 @@ def test_joining_a_new_table_clears_every_per_table_flag():
     assert bot._rejected_plays == 0
     assert bot.seat_bot_controlled is False
     assert (bot._swap_hand, bot._swap_sent, bot._swap_skip) == (None, False, False)
+
+
+# ------------------------------------------- stopping without abandoning a match
+@pytest.mark.parametrize("phase", [0, 14])
+def test_a_pending_stop_holds_ready_between_matches(phase):
+    """READY at 0 or 14 starts the NEXT match -- which we would then walk out
+    of. belot.md penalises that, and enough of it locks table creation."""
+    bot = _bot()
+    bot.stop_requested = True
+    asyncio.run(bot.on_state_update(_lobby_frame(ready=False, phase=phase), "me"))
+    assert bot.client.readies == 0
+
+
+def test_a_pending_stop_still_readies_between_hands():
+    """13 is only the gap between two hands of a match: holding READY there
+    stalls the match instead of finishing it."""
+    bot = _bot()
+    bot.stop_requested = True
+    asyncio.run(bot.on_state_update(_lobby_frame(ready=False, phase=13), "me"))
+    assert bot.client.readies == 1
+
+
+@pytest.mark.parametrize("phase,boundary", [
+    (0, True), (14, True), (13, False), (10, False), (2, False),
+])
+def test_only_phases_0_and_14_are_between_matches(phase, boundary):
+    from belotmd.platform.protocol import between_matches
+    assert between_matches(phase) is boundary

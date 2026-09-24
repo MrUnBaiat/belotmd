@@ -27,7 +27,8 @@ from .game.actions import (ACTION_ACCEPT, ACTION_PASS, CARD_ACTIONS,
 from .platform.client import BelotClient
 from .platform.protocol import (ASCII_TO_ID, BID_PHASES, CHAR_TO_CARD,
                                 DEAL_PHASES, END_PHASES, ID_TO_ASCII,
-                                NOT_STARTED, PLAY, SWAP_SEVEN, DEAL_CARDS_2)
+                                NOT_STARTED, PLAY, SWAP_SEVEN, DEAL_CARDS_2,
+                                between_matches)
 from .platform.sync import StateSynchronizer
 
 
@@ -84,6 +85,10 @@ class LiveBelotBot:
     _recreates = 0
     _recreate_capped = False
     _leave_probes_done = 0
+    # Set by whoever is stopping this bot (a supervisor, a deadline). While it
+    # is set, the bot never announces READY for another match, so the table
+    # cannot start one it would then have to walk out of.
+    stop_requested = False
 
     def __init__(self, config: Config = None, agent=None, agent_kwargs=None):
         self.config = config or Config.from_env()
@@ -97,6 +102,7 @@ class LiveBelotBot:
             table_creator=self.config.table_creator or None,
             join_poll_s=self.config.join_poll_s,
             join_max_polls=self.config.join_max_polls,
+            max_create_failures=self.config.max_create_failures,
             pair_restart_pause_s=self.config.pair_restart_pause_s,
         )
         self.sync_engine = StateSynchronizer()
@@ -292,6 +298,12 @@ class LiveBelotBot:
             # ourselves. The match starts the moment all four players are
             # ready, so a READY sent at the wrong moment is what puts our two
             # accounts on opposite teams -- and nobody can start without us.
+            # On our way out: never ready up for ANOTHER match. Only at a match
+            # boundary, though -- READY is also what deals the next hand of the
+            # current match (phase 13), and withholding it there would stall a
+            # match we are trying to finish, until the platform bot took over.
+            if self.stop_requested and between_matches(phase):
+                return
             if await self._manage_table(raw_state, my_pos):
                 return
             if not self._server_says_ready(raw_state, my_pos):

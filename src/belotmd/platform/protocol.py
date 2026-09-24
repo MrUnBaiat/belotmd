@@ -89,6 +89,21 @@ def match_underway(phase):
     return phase in IN_PLAY_PHASES
 
 
+# The phases in which NO match is in progress at a table: before one starts,
+# and once one has ended. Checked against 14 recordings (2026-09-19): phase 0
+# was never followed by the same match continuing (0 of 916), and phase 14 was
+# always followed by a new one (67 of 67). ROUND_ENDED (13) is deliberately
+# NOT here: it is only the gap between two HANDS of a match, and belot.md
+# penalises an account that leaves matches before they finish -- enough of it
+# and the account can no longer create tables.
+MATCH_BOUNDARY_PHASES = (NOT_STARTED, GAME_ENDED)
+
+
+def between_matches(phase):
+    """Can we leave the table now without abandoning a match?"""
+    return phase in MATCH_BOUNDARY_PHASES
+
+
 # ------------------------------------------------------ recovery policy
 # What to do when a room closes. Most of these are ordinary events in a long
 # session, not failures: a table dissolving at the end of a match is how every
