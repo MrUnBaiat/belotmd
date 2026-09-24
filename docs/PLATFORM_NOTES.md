@@ -701,6 +701,18 @@ differs.
 - **A table survives its match.** Afterwards it stays open; if someone leaves it
   waits for a replacement and for all four to be READY, then deals again. So
   `TABLE_REMOVED` (4003) is not the normal end of a match for a table like this.
+- **The match does not simply end at 101.** **[CONFIRMED live 2026-09-16]** A
+  recorded match reached `106 - 102` — both teams past the target in the same
+  hand — and *kept going*, finishing at 159 over seventeen scored rows. When both
+  cross together the target extends (to 151, per the operator). Nothing in the
+  agent depends on this, because every decision is scored one hand at a time, but
+  **any tool that assumes "first to 101 ends it" will split one match in two**.
+- **A third bolt is the only bolt that moves the score.** The `scoreTable` cell
+  reads `BT-3` exactly like `BT-1` and `BT-2`, but the team's cumulative total
+  **drops by 10** and its bolt counter resets. Reading the marker and carrying the
+  previous total forward — right for the first two — silently overstates that
+  team by 10 from there on. `sync.py:_decode_score_table` applies the rule;
+  anything else that parses the table has to as well.
 - **If the creator leaves while players are still gathering, the table is removed**
   and everyone is kicked. If the creator leaves mid-match, the platform bot takes
   its seat, exactly as for any other timed-out player (§10).
