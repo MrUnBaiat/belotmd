@@ -9,6 +9,28 @@ import WebSocket, { WebSocketServer } from 'ws';
 const BRIDGE_PORT = Number(process.argv[2]) || 8765;
 const BRIDGE_TOKEN = process.argv[3] || "";
 
+// Lifetime. The Python client starts this daemon in a process group of its own,
+// so that a console break meant for the BOT -- "stop at the end of the match" --
+// does not kill the bridge mid-match and abandon the table. Out of the client's
+// group, the daemon no longer dies with its console, so its life is tied to the
+// client by a pipe instead: stdin closes when the client process ends for any
+// reason, a clean close or a hard kill, and the daemon exits with it. Started
+// by hand, without the argument, it keeps the ordinary console behaviour.
+if (process.argv[4] === "--lifeline") {
+    const exitWithClient = (why) => {
+        console.log(`[Bridge] ${why} -- exiting.`);
+        process.exit(0);
+    };
+    process.stdin.on('end', () => exitWithClient("client pipe closed"));
+    process.stdin.on('close', () => exitWithClient("client pipe closed"));
+    process.stdin.on('error', (err) => exitWithClient(`client pipe broken (${err.message})`));
+    process.stdin.resume();
+    // Console control events are the client's to act on. It ends us through
+    // the pipe, or terminate(), once the match it is finishing is over.
+    process.on('SIGINT', () => {});
+    process.on('SIGBREAK', () => {});
+}
+
 // Every HTTP call gets a deadline. Without one a stalled request hangs the
 // bridge forever with no error and no log line -- the bot simply stops, which
 // is indistinguishable from a quiet lobby. A timeout surfaces as an ERROR,

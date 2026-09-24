@@ -118,6 +118,27 @@ class BelotClient:
             probe.bind(("127.0.0.1", 0))
             return probe.getsockname()[1]
 
+    # Tells bridge.js that its stdin is the pipe below, and to live exactly as
+    # long as it stays open.
+    LIFELINE_ARG = "--lifeline"
+
+    @staticmethod
+    def _own_process_group():
+        """Popen arguments that keep console control signals away from the
+        bridge.
+
+        A supervisor stops a bot at the end of the MATCH by sending it a break
+        (Windows: CTRL_BREAK_EVENT to the bot's process group) or an interrupt
+        (a terminal's Ctrl-C reaches the whole foreground group). The bot traps
+        it and finishes the match -- but a bridge in the same group died on the
+        spot (exit 0xC000013A, reproduced), the socket dropped, and the table
+        was abandoned mid-match: the one thing the graceful stop exists to
+        prevent, and something belot.md penalises.
+        """
+        if os.name == "nt":
+            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"start_new_session": True}
+
     def _start_node_daemon(self):
         if not self.bridge_port:
             self.bridge_port = self._free_port()
@@ -127,8 +148,16 @@ class BelotClient:
         if not os.path.exists(bridge_path):
             raise FileNotFoundError(f"bridge.js not found at {bridge_path}")
         try:
+            # Out of our process group, the bridge no longer dies with our
+            # console, so its lifetime is tied to ours by a pipe instead: the
+            # OS closes our end however this process ends -- close(), an
+            # exception, or a hard kill that never runs close() -- and the
+            # bridge exits on EOF. Without that, a killed bot would leave a
+            # daemon behind that is still seated at the table.
             self.node_process = subprocess.Popen(
-                ["node", bridge_path, str(self.bridge_port), self.bridge_token])
+                ["node", bridge_path, str(self.bridge_port), self.bridge_token,
+                 self.LIFELINE_ARG],
+                stdin=subprocess.PIPE, **self._own_process_group())
         except FileNotFoundError:
             raise RuntimeError(
                 "`node` is not on PATH -- the bridge daemon cannot start."
@@ -548,5 +577,14 @@ class BelotClient:
             await self.ws.send(json.dumps({"action": "SEND", "type": action_type, "payload": payload}))
 
     def close(self):
-        if self.node_process:
-            self.node_process.terminate()
+        proc = self.node_process
+        if proc:
+            proc.terminate()
+            # Our end of the lifeline, so the bridge sees EOF even if the
+            # terminate did not land.
+            lifeline = getattr(proc, "stdin", None)
+            if lifeline is not None:
+                try:
+                    lifeline.close()
+                except OSError:
+                    pass
