@@ -112,6 +112,8 @@ belot.md  (Colyseus / WebSocket, msgpack)
     ▼
 platform/bridge.js      Node daemon. Authenticates with cookies, finds or
     │                   joins a table, relays raw state over a local socket.
+    │                   Own process group, so a stop signal meant for the bot
+    │                   cannot kill it mid-match; exits when its client does.
     ▼
 platform/client.py      Message plumbing. Serialized, in-order delivery.
     │
