@@ -428,3 +428,38 @@ def test_a_reseat_between_matches_is_routine_not_a_violation(capsys):
     assert "VIOLATION" not in out, (
         "a seat shuffle between matches is exactly what 4005 is for")
     assert ws.joins == 2
+
+
+# ------------------------------------------ the platform refusing to create
+def test_repeated_refused_creates_stop_the_run_loudly():
+    """belot.md stops an account creating tables after it has left too many
+    matches mid-game. Retrying every few minutes for hours plays nothing."""
+    from belotmd.platform.client import TableCreationRefused
+    refused = {"event": "ERROR", "message": "create redirected to home"}
+    with pytest.raises(TableCreationRefused):
+        _run_connect([refused] * 5, table_mode="create", max_create_failures=3)
+
+
+def test_a_successful_create_resets_the_count():
+    refused = {"event": "ERROR", "message": "create redirected to home"}
+    ws, _, _ = _run_connect([
+        refused, refused,
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+        {"event": "LEAVE", "code": LEAVE_TABLE_REMOVED},
+        refused, refused,
+        {"event": "CONNECTED", "roomId": "r2", "playerId": "p"},
+    ], table_mode="create", max_create_failures=3)
+    assert ws.joins == 6, "four refusals in all, never three in a row"
+
+
+def test_a_guest_waiting_for_its_host_is_not_stopped():
+    """Join-mode errors are the host not being there YET -- not a refusal."""
+    missing = {"event": "ERROR", "message": "table not found",
+               "code": "TABLE_NOT_FOUND"}
+    seen = []
+    _run_connect([missing] * 5 + [
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+    ], prepare=seen.append, table_mode="join", table_creator="Host",
+        max_create_failures=3)
+    assert seen[0].sessions_played == 1
+    assert seen[0].fatal is None

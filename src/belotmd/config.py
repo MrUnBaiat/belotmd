@@ -146,6 +146,11 @@ class Config:
     # again -- the host having deleted its table, the guest having stopped
     # looking. Restarting instantly just recreates the same race.
     pair_restart_pause_s: float = 10.0
+    # Refused table creates in a row before giving up. belot.md stops an
+    # account creating tables after it has left too many matches mid-game, and
+    # says nothing: the create just lands back on the home page. Retrying every
+    # few minutes for hours achieves nothing, so stop and say why.
+    max_create_failures: int = 3
 
     # --- timing ---
     # If the state has not advanced this long after we dispatched an action,
@@ -202,6 +207,7 @@ class Config:
             join_poll_s=float(lookup.get("BELOT_JOIN_POLL", 2)),
             join_max_polls=int(lookup.get("BELOT_JOIN_MAX_POLLS", 20)),
             pair_restart_pause_s=float(lookup.get("BELOT_PAIR_RESTART_PAUSE", 10)),
+            max_create_failures=int(lookup.get("BELOT_MAX_CREATE_FAILURES", 3)),
             env_file=str(env_file or ""),
         )
         for key, value in overrides.items():

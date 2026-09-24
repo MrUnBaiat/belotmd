@@ -26,13 +26,25 @@ from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
 from .tables import CREATE_TABLE_BODY, find_table, is_joinable, table_id_of
 
 
+class TableCreationRefused(RuntimeError):
+    """belot.md refused to create a table several times in a row.
+
+    It does this, silently, once an account has left too many matches before
+    they finished: the create request lands back on the home page and no table
+    exists. It lifts on its own, but not within minutes, so retrying is
+    pointless -- and a run that keeps retrying looks, from the outside, exactly
+    like a run playing nothing for hours.
+    """
+
+
 class BelotClient:
     def __init__(self, cookies: str, bridge_port: int = 0,
                  reconnect: bool = True, retry_delay_s: float = 300.0,
                  rejoin_delay_s: float = 5.0, table_mode: str = "lobby",
                  table_id: str = None, table_creator: str = None,
                  join_poll_s: float = 2.0, join_max_polls: int = 20,
-                 pair_restart_pause_s: float = 10.0):
+                 pair_restart_pause_s: float = 10.0,
+                 max_create_failures: int = 3):
         """`reconnect` keeps the bot looking for tables instead of exiting.
 
         Two delays, because two very different situations end a session:
@@ -63,6 +75,11 @@ class BelotClient:
         self.join_poll_s = float(join_poll_s)
         self.join_max_polls = int(join_max_polls)
         self.pair_restart_pause_s = float(pair_restart_pause_s)
+        # Refused creates in a row, and the error that ends the session once
+        # there are too many. Raised only after the loop has closed cleanly.
+        self.max_create_failures = int(max_create_failures)
+        self._create_failures = 0
+        self.fatal = None
         self._join_polls = 0
         # The table we last sat at, and a note to go straight back to it
         # rather than asking the lobby (see the LEAVE handler).
@@ -203,6 +220,7 @@ class BelotClient:
                     self._in_room = True
                     self._phase = NOT_STARTED
                     self._join_polls = 0
+                    self._create_failures = 0
                     self.sessions_played += 1
                     print(f"[SDK] Joined Game Room: {self.room_id} | Player ID: {self.my_player_id}")
                     await self.deactivate_bot()
@@ -276,6 +294,21 @@ class BelotClient:
                     # itself failed -- almost always "No public open tables
                     # available." Without this the bot sat idle forever
                     # waiting for frames from a room it never entered.
+                    if not self._in_room and self.table_mode == "create":
+                        self._create_failures += 1
+                        if self._create_failures >= self.max_create_failures:
+                            self.fatal = TableCreationRefused(
+                                f"belot.md refused to create a table "
+                                f"{self._create_failures} times in a row "
+                                f"(last: {detail}). It does this after an "
+                                f"account has left too many matches before "
+                                f"they finished. It lifts on its own, later.")
+                            print("=" * 72)
+                            print(f"[SDK][STOP] {self.fatal}")
+                            print("            Not retrying: nothing will play "
+                                  "until the platform allows creating again.")
+                            print("=" * 72)
+                            break
                     if not self._in_room:
                         # The long wait exists for "the lobby is empty", and
                         # neither case here is that. Our partner's table not
@@ -357,6 +390,11 @@ class BelotClient:
 
             await self._queue.put((None, None))     # drain sentinel
             await consumer
+
+        # Outside the connection block, so the bridge socket is closed and the
+        # consumer drained before the caller hears about it.
+        if self.fatal is not None:
+            raise self.fatal
 
     async def _request_table(self, ws, avoid_last=False, table_id=None):
         """Ask the bridge to find a table and join it.
