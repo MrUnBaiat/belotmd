@@ -74,7 +74,10 @@ class Config:
     # observation feature — it is free match score.
     auto_declare: bool = True
     # Four 7s cancels the deal, exactly like LESS_THAN_14: the escape hatch
-    # from a hopeless hand. On.
+    # from a hopeless hand. On. Measured right, both of them, even when our own
+    # side holds the contract: played on, such hands lose 3.5 game points on
+    # average there and 8.4 on the opponents' contracts (100,000 simulated deals,
+    # BelotAgents research/v11 x31).
     declare_four_sevens: bool = True
     # Four 8s silences every combination except bella, OURS INCLUDED. That is
     # a strategic call, not free points. Off.
