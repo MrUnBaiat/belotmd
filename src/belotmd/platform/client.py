@@ -102,6 +102,18 @@ class BelotClient:
         # table, it must not.
         self._leaving_to_restart = False
 
+    # The local socket to the bridge: no keepalive, and no flow control on
+    # reading. It is a loopback link to our own child process, whose death
+    # closes it at once, so a keepalive detects nothing there -- but it can
+    # kill a healthy link. A ping is answered only while the event loop reads,
+    # and the loop stops reading when the unread frames reach `max_queue` (as
+    # during a recovery wait) or while an agent's decision blocks it. Live
+    # (2026-09-29) that closed the socket, 1011 "keepalive ping timeout", just
+    # after the bridge had rejoined a match; the bridge, its client gone, left
+    # the table, and the match was abandoned. A bridge that hangs without
+    # dying shows up instead as a run that receives no frames.
+    BRIDGE_SOCKET = {"ping_interval": None, "max_queue": None}
+
     # How long to wait for `node bridge.js` to bind its port.
     DAEMON_TIMEOUT_S = 15.0
     DAEMON_POLL_S = 0.25
@@ -185,7 +197,7 @@ class BelotClient:
                     f"already in use? `npm install` not run?)"
                 )
             try:
-                ws = await websockets.connect(uri)
+                ws = await websockets.connect(uri, **self.BRIDGE_SOCKET)
                 await self._verify_bridge(ws)
                 if attempt > 1:
                     print(f"[SDK] Bridge daemon ready after {attempt} attempts.")

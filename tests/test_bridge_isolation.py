@@ -144,12 +144,92 @@ def test_the_handshake_guards_the_connect_path(monkeypatch):
 
     ws = FakeWS({"event": "HELLO", "token": "not-ours"})
 
-    async def fake_connect(uri):
+    async def fake_connect(uri, **kwargs):
         return ws
 
     monkeypatch.setattr("belotmd.platform.client.websockets.connect", fake_connect)
     with pytest.raises(RuntimeError, match="not ours"):
         asyncio.run(client._await_daemon("ws://127.0.0.1:4321"))
+
+
+def test_the_bridge_socket_has_no_keepalive_and_no_read_limit(monkeypatch):
+    """Live (2026-09-29): during a recovery wait the unread frames filled the
+    queue, reading paused, the keepalive's pong went unread, and the socket
+    closed with 1011 -- whereupon the bridge left the match it had just
+    rejoined. The loopback link to our own child needs neither."""
+    client = BelotClient(cookies="x")
+    client.node_process = FakePopen(["node"])
+    seen = {}
+
+    async def fake_connect(uri, **kwargs):
+        seen.update(kwargs)
+        return FakeWS({"event": "HELLO", "token": client.bridge_token})
+
+    monkeypatch.setattr("belotmd.platform.client.websockets.connect", fake_connect)
+    asyncio.run(client._await_daemon("ws://127.0.0.1:4321"))
+    assert seen.get("ping_interval", 20) is None, "keepalive still on"
+    assert seen.get("max_queue", 16) is None, "reading still pauses when full"
+
+
+def _flood_then_wait(settings, frames=100, wait_s=1.5):
+    """A real server sends `frames` at once; we read none of them for `wait_s`
+    -- a recovery wait -- then read them all and check the link still carries
+    a round trip. -> (survived, why it closed if it did).
+
+    The round trip is the test. Frames that arrived before reading paused are
+    already buffered and read back fine from a link that has since failed."""
+    import websockets
+    from websockets.asyncio.server import serve
+
+    async def handler(conn):
+        for i in range(frames):
+            await conn.send(json.dumps({"event": "STATE", "i": i}))
+        try:
+            async for msg in conn:          # then echo
+                await conn.send(msg)
+        except websockets.ConnectionClosed:
+            pass
+
+    async def go():
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with websockets.connect(f"ws://127.0.0.1:{port}",
+                                          **settings) as ws:
+                await asyncio.sleep(wait_s)
+                got = 0
+                try:
+                    while got < frames:
+                        await asyncio.wait_for(ws.recv(), 2.0)
+                        got += 1
+                    await ws.send("still there?")
+                    echo = await asyncio.wait_for(ws.recv(), 2.0)
+                except (websockets.ConnectionClosed, asyncio.TimeoutError) as exc:
+                    return False, str(exc)
+                return echo == "still there?", ""
+
+    return asyncio.run(go())
+
+
+def test_the_incident_reproduces_with_a_keepalive_and_a_read_limit():
+    """The control: the old settings (with the keepalive's 20s shortened) lose
+    the link exactly as live -- the queue fills, reading stops, the pong is
+    never read. Without this the test below could pass for any reason."""
+    survived, why = _flood_then_wait({"ping_interval": 0.2,
+                                      "ping_timeout": 0.2})
+    assert not survived
+    assert "keepalive ping timeout" in why, why
+
+
+def test_the_bridge_socket_survives_a_wait_with_frames_arriving():
+    survived, why = _flood_then_wait(BelotClient.BRIDGE_SOCKET)
+    assert survived, why
+
+
+def test_either_setting_alone_would_have_saved_that_link():
+    """Reading never pausing is enough by itself: the pong is read in time."""
+    survived, why = _flood_then_wait({"ping_interval": 0.2, "ping_timeout": 0.2,
+                                      "max_queue": None})
+    assert survived, why
 
 
 # ------------------------------------------------------- the real thing
