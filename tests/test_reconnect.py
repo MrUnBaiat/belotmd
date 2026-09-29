@@ -435,13 +435,17 @@ def test_repeated_refused_creates_stop_the_run_loudly():
     """belot.md stops an account creating tables after it has left too many
     matches mid-game. Retrying every few minutes for hours plays nothing."""
     from belotmd.platform.client import TableCreationRefused
-    refused = {"event": "ERROR", "message": "create redirected to home"}
     with pytest.raises(TableCreationRefused):
-        _run_connect([refused] * 5, table_mode="create", max_create_failures=3)
+        _run_connect([REFUSED] * 5, table_mode="create", max_create_failures=3)
+
+
+# What the bridge says when the platform turns a create down (as seen live).
+REFUSED = {"event": "ERROR", "code": "CREATE_REFUSED",
+           "message": "Created a table, but its tokens did not parse."}
 
 
 def test_a_successful_create_resets_the_count():
-    refused = {"event": "ERROR", "message": "create redirected to home"}
+    refused = REFUSED
     ws, _, _ = _run_connect([
         refused, refused,
         {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
@@ -463,3 +467,17 @@ def test_a_guest_waiting_for_its_host_is_not_stopped():
         max_create_failures=3)
     assert seen[0].sessions_played == 1
     assert seen[0].fatal is None
+
+
+def test_only_a_refused_create_counts_towards_giving_up():
+    """A network failure is not the platform saying no. Stopping on three of
+    them told the owner the account was barred when it was not."""
+    down = {"event": "ERROR", "message": "fetch failed"}
+    seen = []
+    ws, slept, _ = _run_connect([down] * 5 + [
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+    ], prepare=seen.append, table_mode="create", max_create_failures=3,
+        retry_delay_s=300)
+    assert seen[0].fatal is None
+    assert seen[0].sessions_played == 1
+    assert slept == [300] * 5, "still the long wait between tries"

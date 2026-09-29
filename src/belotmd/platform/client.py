@@ -329,13 +329,20 @@ class BelotClient:
                             break
 
                 elif event == "ERROR":
-                    detail = msg.get("message") or msg.get("code")
+                    code = msg.get("code")
+                    detail = msg.get("message") or code
                     print(f"[SDK Error]: {detail}")
                     # An error while we are NOT in a room means the join
                     # itself failed -- almost always "No public open tables
                     # available." Without this the bot sat idle forever
                     # waiting for frames from a room it never entered.
-                    if not self._in_room and self.table_mode == "create":
+                    #
+                    # Only a create the platform turned down counts towards
+                    # giving up. A network failure is not a refusal, and
+                    # stopping on three of them said the account was barred
+                    # when it was not.
+                    if (not self._in_room and self.table_mode == "create"
+                            and code == "CREATE_REFUSED"):
                         self._create_failures += 1
                         if self._create_failures >= self.max_create_failures:
                             self.fatal = TableCreationRefused(

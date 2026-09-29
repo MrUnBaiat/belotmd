@@ -176,15 +176,25 @@ async function connectToGame(cookieString, say, session, avoidLast = false,
                 body: table.body,
                 signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
             const html = await createRes.text();      // always drain the body
+            // Both failures below are the platform answering "no" to the
+            // create itself, which is how it bars an account that has left
+            // too many matches. Tagged, so Python counts these and nothing
+            // else: a network error is not a refusal.
             if (createRes.status >= 400) {
-                throw new Error(`Creating a table failed (HTTP ${createRes.status}).`);
+                const err = new Error(`Creating a table failed (HTTP ${createRes.status}).`);
+                err.code = "CREATE_REFUSED";
+                throw err;
             }
             ({ wsUrl, roomId, playerToken, playerId } = scrapeTokens(html));
             if (!wsUrl || !roomId) {
                 // Landed somewhere other than the gameplay page; ask for it.
                 ({ wsUrl, roomId, playerToken, playerId } = await readTokens(headers));
             }
-            if (!wsUrl || !roomId) throw new Error("Created a table, but its tokens did not parse.");
+            if (!wsUrl || !roomId) {
+                const err = new Error("Created a table, but its tokens did not parse.");
+                err.code = "CREATE_REFUSED";
+                throw err;
+            }
             console.log(`[Bridge] Created a table; seated in room ${roomId}.`);
         } else if (table && table.mode === "join") {
             console.log(`[Bridge] Joining table ${table.tableId}...`);
