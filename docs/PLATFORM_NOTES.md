@@ -166,6 +166,31 @@ Separately, a join can fail before any room exists — an empty lobby answers
 with no open table at all. That is not a close code and arrives on a different
 path, but it needs the same treatment: wait, then look again.
 
+#### `1006`: the connection dropped **[OBSERVED once, 2026-09-29]**
+
+Not one of belot.md's codes: the WebSocket standard's *abnormal closure*, a
+connection that ended without a close frame. It arrived once in the 589 room
+closes recorded to date, mid-hand. **The platform keeps the seat**: five minutes later the
+gameplay page still offered that game back, and a CONNECT (which tries an
+active game before anything else) rejoined it. So the client goes straight
+back — at once the first time, on the short cadence if drops repeat within a
+minute — and for two minutes after a mid-match drop retries a failed rejoin on
+that cadence too. An unrecognised code during a match gets the same treatment;
+between matches it still gets the long wait.
+
+What the old handling (the long wait for any unknown code) cost, in order: the
+agent kept acting on queued frames and the bridge answered each move with
+`SEND with no active room`, which was read as a failed join and started a
+second five-minute wait; the bridge meanwhile rejoined the game and forwarded
+frames nobody read; reading paused, the local socket's keepalive timed out
+(1011), and the bridge, its client gone, left the room. **The match was
+abandoned, and the platform then refused to let the account create tables**
+(below). The fixes, one per link: the drop is rejoined at once; the bridge tags
+that answer `NO_ROOM` and the client ignores it; the local socket has no
+keepalive and never stops reading; and a host back in its match between two
+hands (phase 13) is told so (`resumed_match`), so it does not take the table
+for a fresh one and delete it after the start grace.
+
 ---
 
 ## 4. State payload
@@ -683,6 +708,12 @@ createNewTable=1&gametable_type=4&gametable_level=0&miza=50&gametable_color=1&ga
   the ones the Colyseus join takes. Follow the redirect rather than handling it
   manually — an unread `redirect: "manual"` response leaves a body nobody drains,
   and the next request on that pooled connection stalls indefinitely.
+- **An account that has left too many matches before they finished cannot create
+  tables** for a while: the create lands on a page with no game on it, which the
+  bridge reports as `CREATE_REFUSED`. Seen on 2026-09-19 (50 refusals in a run) and
+  on 2026-09-29 (after the abandoned match under *Room close codes*). It lifts on
+  its own; how long it lasts is not known. Only this code counts towards the
+  client giving up — a network error is not a refusal.
 - **An account cannot create a table while it is seated at one.** Rejoining an
   active game must therefore be tried first — which is also how a reconnecting host
   gets back to its own table.

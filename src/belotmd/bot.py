@@ -223,6 +223,14 @@ class LiveBelotBot:
             self._room_seq = seq
             self._reset_room_state()
             self._agent_reset()
+            if getattr(self.client, "resumed_match", False):
+                # Back in a match we lost the connection to, not at a new
+                # table. Between two of its hands (phase 13) the table looks
+                # idle, and a host that thought the match had not started
+                # would delete the table after its start grace -- walking out
+                # of the very match it just came back to.
+                print("[Bot] Resuming a match in progress at this table.")
+                self._table_started = True
 
     async def on_state_update(self, raw_state: dict, my_player_id: str):
         try:

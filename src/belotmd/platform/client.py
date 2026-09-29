@@ -22,7 +22,8 @@ from websockets.exceptions import WebSocketException
 from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
                        LEAVE_KICKED, LEAVE_POSITION_CHANGED, NOT_STARTED,
                        RECOVER_LATER, RECOVER_NOW, RECOVER_SOON, RECOVER_STOP,
-                       SUIT_TO_INT, leave_recovery, match_underway)
+                       SUIT_TO_INT, between_matches, leave_recovery,
+                       match_underway)
 from .tables import CREATE_TABLE_BODY, find_table, is_joinable, table_id_of
 
 
@@ -101,6 +102,15 @@ class BelotClient:
         # normally ends the session; when we left in order to make a better
         # table, it must not.
         self._leaving_to_restart = False
+        # Losing the connection to a table (see `_after_a_drop`): when it last
+        # happened, the room it took with it, and until when a failed attempt
+        # to get back is retried at once rather than after the long wait.
+        self._last_drop_at = None
+        self._lost_room = None
+        self._rescue_until = 0.0
+        # True when the room we are in is the match we lost the connection
+        # to, rather than a new table -- the bot must not treat it as fresh.
+        self.resumed_match = False
 
     # The local socket to the bridge: no keepalive, and no flow control on
     # reading. It is a loopback link to our own child process, whose death
@@ -119,6 +129,13 @@ class BelotClient:
     DAEMON_POLL_S = 0.25
     # How long to wait for that daemon to identify itself.
     HELLO_TIMEOUT_S = 5.0
+    # A lost connection is rejoined at once -- but one that keeps dropping is
+    # rejoined on the ordinary short cadence, not in a tight loop.
+    DROP_REPEAT_S = 60.0
+    # After losing the connection in a match, a failed attempt to get back is
+    # retried on the short cadence for this long rather than after the long
+    # wait: the match is being played without us meanwhile.
+    MATCH_RESCUE_S = 120.0
 
     @staticmethod
     def _free_port():
@@ -262,8 +279,22 @@ class BelotClient:
                     self._phase = NOT_STARTED
                     self._join_polls = 0
                     self._create_failures = 0
+                    # Back in the match we lost, or somewhere new? The bridge
+                    # returns to an active game first, so it is the same room
+                    # whenever the platform still had us in it.
+                    self.resumed_match = (
+                        time.monotonic() < self._rescue_until
+                        and self.room_id is not None
+                        and self.room_id == self._lost_room)
+                    self._rescue_until = 0.0
+                    self._lost_room = None
                     self.sessions_played += 1
                     print(f"[SDK] Joined Game Room: {self.room_id} | Player ID: {self.my_player_id}")
+                    if self.resumed_match:
+                        print("[SDK] Back in the match we lost the connection "
+                              "to.")
+                    # Also what takes our seat back from the platform's bot,
+                    # if it stood in while we were away.
                     await self.deactivate_bot()
 
                 elif event == "STATE":
@@ -332,6 +363,15 @@ class BelotClient:
                     code = msg.get("code")
                     detail = msg.get("message") or code
                     print(f"[SDK Error]: {detail}")
+                    if code == "NO_ROOM":
+                        # The bridge's answer to a move sent while no room was
+                        # open: our agent acting on a frame from before the
+                        # room closed. It says nothing about any join, so it
+                        # must not be read as one failing. Live (2026-09-29) it
+                        # was, and started a second five-minute wait while the
+                        # bridge was already back in the match.
+                        continue
+                    rescuing = time.monotonic() < self._rescue_until
                     # An error while we are NOT in a room means the join
                     # itself failed -- almost always "No public open tables
                     # available." Without this the bot sat idle forever
@@ -371,17 +411,30 @@ class BelotClient:
                         # keeps the guest on its 2s cadence rather than the
                         # 5s one meant for "a match just ended".
                         joining = self.table_mode == "join"
-                        if joining:
+                        delay = self.join_poll_s if joining else None
+                        if rescuing and code != "CREATE_REFUSED":
+                            # Getting back to a match we lost the connection
+                            # to failed -- most likely the same blip. The match
+                            # goes on without us, so try again on the short
+                            # cadence, and straight to that table: the lobby
+                            # lists it as full, one of the seats being ours.
+                            soon = True
+                            delay = self.rejoin_delay_s
+                            if self._last_table_id:
+                                self._rejoin_hint = self._last_table_id
+                        elif joining:
                             self._join_polls += 1
                         if not await self._recover(
                                 ws, RECOVER_SOON if soon else RECOVER_LATER,
                                 f"could not join a table ({detail})",
-                                delay=self.join_poll_s if joining else None):
+                                delay=delay):
                             break
 
                 elif event == "LEAVE":
                     code = msg.get("code")
                     label = LEAVE_NAMES.get(code, "UNKNOWN")
+                    # Read before a rejoin resets the phase.
+                    mid_match = not between_matches(self._phase)
                     self._in_room = False
                     restart_pause = None
                     if code == LEAVE_POSITION_CHANGED and self._last_table_id:
@@ -406,11 +459,16 @@ class BelotClient:
                               f"settling for {restart_pause:.0f}s, then making "
                               f"another.")
                     else:
-                        action = leave_recovery(code)
+                        action = leave_recovery(code, mid_match=mid_match)
+                        if (action == RECOVER_NOW
+                                and code != LEAVE_POSITION_CHANGED):
+                            restart_pause = self._after_a_drop(mid_match)
 
                     if label == "UNKNOWN":
                         print(f"[SDK][WARN] unrecognised close code {code}; "
-                              f"treating it as recoverable.")
+                              + ("treating it as a dropped connection, since a "
+                                 "match is under way." if mid_match else
+                                 "treating it as recoverable."))
                     if (code == LEAVE_POSITION_CHANGED
                             and match_underway(self._phase)):
                         # A cheap assertion on a platform invariant: the host
@@ -443,6 +501,29 @@ class BelotClient:
         # consumer drained before the caller hears about it.
         if self.fatal is not None:
             raise self.fatal
+
+    def _after_a_drop(self, mid_match):
+        """We lost the room without being removed from it. -> the pause before
+        going back, or None for at once.
+
+        Going back is the whole recovery: the bridge's CONNECT returns to an
+        active game before it does anything else. At once the first time; on
+        the short cadence if it keeps happening, so a connection that keeps
+        failing is not retried in a tight loop.
+        """
+        now = time.monotonic()
+        again = (self._last_drop_at is not None
+                 and now - self._last_drop_at < self.DROP_REPEAT_S)
+        self._last_drop_at = now
+        if mid_match:
+            self._rescue_until = now + self.MATCH_RESCUE_S
+            self._lost_room = self.room_id
+            print("[SDK] Lost the connection in the middle of a match; going "
+                  "back to it (the platform keeps our seat).")
+        if self._last_table_id:
+            # Joining: straight to that table, not via the lobby.
+            self._rejoin_hint = self._last_table_id
+        return self.rejoin_delay_s if again else None
 
     async def _request_table(self, ws, avoid_last=False, table_id=None):
         """Ask the bridge to find a table and join it.

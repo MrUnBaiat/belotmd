@@ -66,10 +66,16 @@ LEAVE_TABLE_REMOVED    = 4003   # table dissolved
 LEAVE_I_LEFT           = 4004   # we left
 LEAVE_POSITION_CHANGED = 4005   # lobby-only: seats shuffle as players gather
 
+# Not one of belot.md's: the WebSocket standard's "abnormal closure". The
+# connection to the game server ended without a close frame -- a network blip,
+# or the server going away. Nobody removed us, and the platform keeps our seat.
+CONNECTION_DROPPED     = 1006
+
 LEAVE_NAMES = {
     LEAVE_OTHER_SESSION: "OTHER_SESSION", LEAVE_KICKED: "KICKED",
     LEAVE_TABLE_REMOVED: "TABLE_REMOVED", LEAVE_I_LEFT: "I_LEFT",
     LEAVE_POSITION_CHANGED: "POSITION_CHANGED",
+    CONNECTION_DROPPED: "CONNECTION_DROPPED",
 }
 
 
@@ -139,15 +145,35 @@ LEAVE_RECOVERY = {
     # removed -- only seat indices changed -- so rejoining is both safe and
     # necessary: every seat-indexed belief now describes a different player.
     LEAVE_POSITION_CHANGED: RECOVER_NOW,
+
+    # The connection dropped. Seen live (2026-09-29) in the middle of a hand:
+    # five minutes later the site still offered that game back, so the seat
+    # was being kept for us -- and the bridge's CONNECT returns to an active
+    # game before it does anything else. Go straight back. Every second away
+    # is a turn the platform's bot plays for us, and a match we are not at when
+    # it ends is a match left, which belot.md penalises by refusing to let the
+    # account create tables. The five-minute wait this used to get did exactly
+    # that.
+    CONNECTION_DROPPED: RECOVER_NOW,
 }
 
 # An unrecognised code keeps the bot alive rather than ending an overnight
-# run, but on the long delay and with a warning.
+# run, but on the long delay and with a warning -- unless a match is under
+# way (see `leave_recovery`).
 DEFAULT_RECOVERY = RECOVER_LATER
 
 
-def leave_recovery(code):
-    """-> one of the RECOVER_* constants for a room close code."""
+def leave_recovery(code, mid_match=False):
+    """-> one of the RECOVER_* constants for a room close code.
+
+    `mid_match`: a match was in progress at the table (not `between_matches`).
+    An unrecognised close is then treated as a dropped connection rather than
+    given the long wait: going back returns us to that match if the platform
+    still has us in it and finds another table if not, while waiting five
+    minutes abandons the match whichever it was.
+    """
+    if code not in LEAVE_RECOVERY and mid_match:
+        return RECOVER_NOW
     return LEAVE_RECOVERY.get(code, DEFAULT_RECOVERY)
 
 

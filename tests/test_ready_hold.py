@@ -326,6 +326,34 @@ def test_a_table_that_dealt_a_hand_is_never_abandoned():
     assert bot.client.leaves == 0
 
 
+def _back_between_hands(resumed):
+    """A host rejoins its table at phase 13 -- between two hands -- after
+    losing the connection; the table has been full for longer than the start
+    grace. -> how many times it left."""
+    bot = _bot()
+    _feed(bot, _lobby(["a", PARTNER, "c", ME], ready=True, phase=10))
+    bot.client.sessions_played += 1                 # the bridge rejoined
+    bot.client.resumed_match = resumed
+    between = _lobby(["a", PARTNER, "c", ME], ready=True, phase=13)
+    _feed(bot, between)
+    if bot._full_since is not None:
+        bot._full_since -= bot.TABLE_START_GRACE_S + 1
+    _feed(bot, between)
+    return bot.client.leaves
+
+
+def test_a_host_back_in_its_match_does_not_walk_out_of_it():
+    """Between two hands the table looks idle. A host that took it for a new
+    table would delete it after the start grace -- abandoning the match it had
+    just got back to."""
+    assert _back_between_hands(resumed=True) == 0
+
+
+def test_without_the_resume_flag_that_table_would_be_deleted():
+    """The control: the rule above is what saves the match."""
+    assert _back_between_hands(resumed=False) == 1
+
+
 # -------------------------------------------------------- the leave probe
 #
 # Abandoning a table is the one path that cannot be rehearsed against a real

@@ -112,7 +112,9 @@ wss.on('connection', (pySocket) => {
                 // bridge only fetches the list.
                 say({ event: "LOBBY", mese: await fetchLobby(cmd.cookies) });
             } else if (cmd.action === "SEND") {
-                if (!session.room) { say({ event: "ERROR", message: "SEND with no active room" }); return; }
+                // Tagged, so Python can tell a move that arrived after the
+                // room closed from a join that failed.
+                if (!session.room) { say({ event: "ERROR", code: "NO_ROOM", message: "SEND with no active room" }); return; }
                 session.room.send(cmd.type, cmd.payload);
             } else if (cmd.action === "LEAVE") {
                 dropRoom();

@@ -17,7 +17,8 @@ import json
 import pytest
 
 from belotmd.platform.client import BelotClient
-from belotmd.platform.protocol import (LEAVE_I_LEFT, LEAVE_KICKED,
+from belotmd.platform.protocol import (CONNECTION_DROPPED, LEAVE_I_LEFT,
+                                       LEAVE_KICKED,
                                        LEAVE_OTHER_SESSION,
                                        LEAVE_POSITION_CHANGED,
                                        LEAVE_TABLE_REMOVED, RECOVER_LATER,
@@ -481,3 +482,152 @@ def test_only_a_refused_create_counts_towards_giving_up():
     assert seen[0].fatal is None
     assert seen[0].sessions_played == 1
     assert slept == [300] * 5, "still the long wait between tries"
+
+
+# ------------------------------- losing the connection in the middle of a match
+#
+# Live, 2026-09-29, host account, mid-hand: the room connection closed with
+# 1006 (no close frame). The chain that followed abandoned the match, and
+# belot.md then refused the account new tables:
+#   1. 1006 was unrecognised, so it got the five-minute wait;
+#   2. our agent, still acting on queued frames, sent a move; the bridge
+#      answered "SEND with no active room", and that was read as a failed join
+#      -- a second five-minute wait, while the bridge was already back in the
+#      match (a CONNECT returns to an active game first);
+#   3. nobody read the frames it forwarded, reading paused, the keepalive timed
+#      out (1011), and the bridge, its client gone, left the table.
+# Step 3 is covered in test_bridge_isolation.py; 1 and 2 here.
+
+def _mid_match(*after, room="r"):
+    """Seated at `room`, in the middle of a hand, then `after`."""
+    return [{"event": "CONNECTED", "roomId": room, "playerId": "p"},
+            {"event": "STATE", "data": {"currentPhase": 10}}, *after]
+
+
+DROP = {"event": "LEAVE", "code": CONNECTION_DROPPED}
+NO_ROOM = {"event": "ERROR", "code": "NO_ROOM",
+           "message": "SEND with no active room"}
+
+
+def _back(room="r"):
+    return {"event": "CONNECTED", "roomId": room, "playerId": "p"}
+
+
+def test_a_dropped_connection_is_rejoined_at_once():
+    assert leave_recovery(CONNECTION_DROPPED) == RECOVER_NOW
+    ws, slept, _ = _run_connect(_mid_match(DROP, _back()))
+    assert ws.joins == 2
+    assert slept == [], "every second away is a turn the platform's bot plays"
+
+
+def test_a_move_answered_with_no_room_is_not_a_failed_join():
+    seen = []
+    ws, slept, _ = _run_connect(_mid_match(DROP, NO_ROOM, _back()),
+                                prepare=seen.append, table_mode="create")
+    assert ws.joins == 2, "the stale error asked for another table"
+    assert slept == []
+    assert seen[0]._create_failures == 0
+
+
+def test_the_2026_09_29_incident_ends_back_in_the_match():
+    seen = []
+    ws, slept, _ = _run_connect(
+        _mid_match(DROP, NO_ROOM, _back(),
+                   {"event": "STATE", "data": {"currentPhase": 10}}),
+        prepare=seen.append, table_mode="create")
+    client = seen[0]
+    assert slept == []
+    assert client.resumed_match is True
+    assert client.fatal is None
+
+
+def test_a_connection_that_keeps_dropping_is_not_retried_in_a_tight_loop():
+    ws, slept, _ = _run_connect(
+        _mid_match(DROP, _back(),
+                   {"event": "STATE", "data": {"currentPhase": 10}},
+                   DROP, _back()),
+        rejoin_delay_s=5)
+    assert ws.joins == 3
+    assert slept == [5], "at once the first time, then the short cadence"
+
+
+def test_a_failed_rejoin_during_a_match_is_retried_quickly():
+    """The match goes on without us; five minutes away is the match lost."""
+    down = {"event": "ERROR", "message": "fetch failed"}
+    seen = []
+    ws, slept, _ = _run_connect(_mid_match(DROP, down, down, _back()),
+                                prepare=seen.append, table_mode="create",
+                                rejoin_delay_s=5, retry_delay_s=300)
+    assert slept == [5, 5]
+    assert seen[0]._create_failures == 0
+    assert seen[0].resumed_match is True
+
+
+def test_the_quick_retries_end_with_the_rescue_window():
+    down = {"event": "ERROR", "message": "fetch failed"}
+
+    def expired(client):
+        client.MATCH_RESCUE_S = -1.0          # already over
+    ws, slept, _ = _run_connect(_mid_match(DROP, down, _back()),
+                                prepare=expired, table_mode="create",
+                                rejoin_delay_s=5, retry_delay_s=300)
+    assert slept == [300]
+
+
+def test_a_refused_create_during_a_rescue_still_counts():
+    """If the match is gone, the bridge goes on to create -- and a refusal
+    there is a refusal like any other."""
+    seen = []
+    ws, slept, _ = _run_connect(_mid_match(DROP, REFUSED, _back("r2")),
+                                prepare=seen.append, table_mode="create",
+                                rejoin_delay_s=5, retry_delay_s=300)
+    assert slept == [300]
+    assert seen[0].resumed_match is False, "a new table, not the match"
+
+
+def test_a_guest_goes_back_to_its_table_not_via_the_lobby():
+    """The lobby lists our own table as full -- one of the seats is ours -- and
+    a guest that finds it full stands down."""
+    def seated(client):
+        client._last_table_id = "t1"
+    down = {"event": "ERROR", "message": "fetch failed"}
+    ws, slept, _ = _run_connect(_mid_match(DROP, down, _back()),
+                                prepare=seated, table_mode="join",
+                                table_creator="Host", rejoin_delay_s=5)
+    after_drop = ws.sent[1:]
+    assert [m["action"] for m in after_drop] == ["CONNECT", "CONNECT"]
+    assert all(m["table"] == {"mode": "join", "tableId": "t1"}
+               for m in after_drop)
+    assert slept == [5]
+
+
+@pytest.mark.parametrize("phase,wait", [
+    (2, []), (10, []), (13, []),       # a match is on: go back at once
+    (0, [300]), (14, [300]),           # between matches: the old caution
+])
+def test_an_unknown_close_is_a_drop_only_during_a_match(phase, wait):
+    assert leave_recovery(4099, mid_match=True) == RECOVER_NOW
+    ws, slept, _ = _run_connect([
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+        {"event": "STATE", "data": {"currentPhase": phase}},
+        {"event": "LEAVE", "code": 4099},
+        _back(),
+    ], retry_delay_s=300)
+    assert slept == wait
+
+
+def test_a_drop_between_matches_is_not_a_resumed_match():
+    """Nothing was under way, so the bot must treat the table as it finds it."""
+    seen = []
+    _run_connect([
+        {"event": "CONNECTED", "roomId": "r", "playerId": "p"},
+        {"event": "STATE", "data": {"currentPhase": 0}},
+        DROP, _back(),
+    ], prepare=seen.append)
+    assert seen[0].resumed_match is False
+
+
+def test_a_new_table_after_a_drop_is_not_a_resumed_match():
+    seen = []
+    _run_connect(_mid_match(DROP, _back("r2")), prepare=seen.append)
+    assert seen[0].resumed_match is False
