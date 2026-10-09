@@ -726,6 +726,16 @@ createNewTable=1&gametable_type=4&gametable_level=0&miza=50&gametable_color=1&ga
 values. This is the same call the lobby pick already used — only the `gameId`
 differs.
 
+**A private table** (`pass: true` in the lobby listing) takes the same call with
+its password filled in: `enterGame=4&gameId=new-46150679&password=<password>`.
+This is the account owner's description of the site's own request (2026-10-09);
+no recorded run has exercised it yet, and what a wrong password answers is not
+known — the bridge treats anything but `{"success":"gameplay_new.php"}` as a
+refused seat. The client therefore gives up after three refused seats in a row at
+a password table (`TableJoinRefused`) rather than send the same wrong password
+every two seconds, and does not go back to a table it joined by name after being
+removed from it (`4002`).
+
 ### Starting, ending, and leaving
 
 - **The match starts when all four players are READY.** There is no host "start".

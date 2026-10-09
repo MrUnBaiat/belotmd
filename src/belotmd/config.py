@@ -107,6 +107,9 @@ class Config:
     table_mode: str = "lobby"
     table_id: str = ""
     table_creator: str = ""
+    # The password of a private table, sent with the seat reservation when
+    # joining. Empty for an open table.
+    table_password: str = ""
 
     # Our other account's username. Setting it means "we are playing as a
     # pair": the bot then withholds READY until that account is sitting
@@ -201,6 +204,7 @@ class Config:
             table_mode=lookup.get("BELOT_TABLE_MODE", "lobby"),
             table_id=lookup.get("BELOT_TABLE_ID", ""),
             table_creator=lookup.get("BELOT_TABLE_CREATOR", ""),
+            table_password=lookup.get("BELOT_TABLE_PASSWORD", ""),
             partner=lookup.get("BELOT_PARTNER", ""),
             rotation_probe=int(lookup.get("BELOT_ROTATION_PROBE", 0) or 0),
             leave_probe=int(lookup.get("BELOT_LEAVE_PROBE", 0) or 0),

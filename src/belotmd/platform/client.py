@@ -38,6 +38,13 @@ class TableCreationRefused(RuntimeError):
     """
 
 
+class TableJoinRefused(RuntimeError):
+    """The table we were told to join will not have us, and asking again is
+    the wrong answer: a password table that refused the seat several times in
+    a row (each further try is one more wrong password), or a table whose
+    owner removed us."""
+
+
 class BelotClient:
     def __init__(self, cookies: str, bridge_port: int = 0,
                  reconnect: bool = True, retry_delay_s: float = 300.0,
@@ -45,7 +52,8 @@ class BelotClient:
                  table_id: str = None, table_creator: str = None,
                  join_poll_s: float = 2.0, join_max_polls: int = 20,
                  pair_restart_pause_s: float = 10.0,
-                 max_create_failures: int = 3):
+                 max_create_failures: int = 3,
+                 table_password: str = None):
         """`reconnect` keeps the bot looking for tables instead of exiting.
 
         Two delays, because two very different situations end a session:
@@ -71,6 +79,10 @@ class BelotClient:
         self.table_mode = table_mode
         self.table_id = table_id
         self.table_creator = table_creator
+        # A private table's password, sent with every seat request in "join"
+        # mode, and the refused seats in a row at such a table.
+        self.table_password = table_password or None
+        self._refused_joins = 0
         # Watching the lobby for our partner's table: how often, and how many
         # fruitless looks before standing down for a while.
         self.join_poll_s = float(join_poll_s)
@@ -123,6 +135,12 @@ class BelotClient:
     # the table, and the match was abandoned. A bridge that hangs without
     # dying shows up instead as a run that receives no frames.
     BRIDGE_SOCKET = {"ping_interval": None, "max_queue": None}
+
+    # Refused seats in a row at a password table before giving up on it. A
+    # table that vanished or filled as we sat down explains one or two; after
+    # that the likeliest cause is the password, and every further try is
+    # another wrong one sent to somebody's private table.
+    MAX_REFUSED_JOINS = 3
 
     # How long to wait for `node bridge.js` to bind its port.
     DAEMON_TIMEOUT_S = 15.0
@@ -279,6 +297,7 @@ class BelotClient:
                     self._phase = NOT_STARTED
                     self._join_polls = 0
                     self._create_failures = 0
+                    self._refused_joins = 0
                     # Back in the match we lost, or somewhere new? The bridge
                     # returns to an active game first, so it is the same room
                     # whenever the platform still had us in it.
@@ -424,6 +443,16 @@ class BelotClient:
                                 self._rejoin_hint = self._last_table_id
                         elif joining:
                             self._join_polls += 1
+                            if (self.table_password
+                                    and code == "TABLE_NOT_FOUND"):
+                                self._refused_joins += 1
+                                if self._refused_joins >= self.MAX_REFUSED_JOINS:
+                                    self._give_up_on_the_table(
+                                        f"{self._table_name()} refused the "
+                                        f"seat {self._refused_joins} times in "
+                                        f"a row (last: {detail}). Most likely "
+                                        f"the password is wrong")
+                                    break
                         if not await self._recover(
                                 ws, RECOVER_SOON if soon else RECOVER_LATER,
                                 f"could not join a table ({detail})",
@@ -437,6 +466,15 @@ class BelotClient:
                     mid_match = not between_matches(self._phase)
                     self._in_room = False
                     restart_pause = None
+                    if code == LEAVE_KICKED and self.table_mode == "join":
+                        # We came to this table by name, and its owner took us
+                        # off it. Looking it up again would sit us straight
+                        # back down, every few seconds, for as long as they
+                        # kept removing us.
+                        self._give_up_on_the_table(
+                            f"removed from {self._table_name()} by its owner "
+                            f"({label}, {code})")
+                        break
                     if code == LEAVE_POSITION_CHANGED and self._last_table_id:
                         # The host rotated the seats. Nobody was removed: the
                         # platform still has us at this table, so go back to it
@@ -502,6 +540,18 @@ class BelotClient:
         if self.fatal is not None:
             raise self.fatal
 
+    def _table_name(self):
+        """The table "join" mode is after, for a message."""
+        return (f"{self.table_creator}'s table" if self.table_creator
+                else f"table {self.table_id}")
+
+    def _give_up_on_the_table(self, why):
+        """End the session for good; `connect` raises this once it has closed."""
+        self.fatal = TableJoinRefused(f"{why}. Not going back.")
+        print("=" * 72)
+        print(f"[SDK][STOP] {self.fatal}")
+        print("=" * 72)
+
     def _after_a_drop(self, mid_match):
         """We lost the room without being removed from it. -> the pause before
         going back, or None for at once.
@@ -559,6 +609,8 @@ class BelotClient:
             request["table"] = {"mode": "create", "body": CREATE_TABLE_BODY}
         elif self.table_mode == "join":
             request["table"] = {"mode": "join", "tableId": table_id}
+            if self.table_password:
+                request["table"]["password"] = self.table_password
             self._last_table_id = table_id
         await ws.send(json.dumps(request))
 

@@ -9,6 +9,7 @@ the two-step join is driven against a fake bridge.
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -123,12 +124,14 @@ async def _noop(*a, **kw):
     pass
 
 
-def _drive(script, **kwargs):
+def _drive(script, raises=None, **kwargs):
     """Drive the REAL `connect()` loop against a scripted bridge.
 
     Deliberately not a reimplementation of the lobby handling: the point is to
     exercise the branch that decides which table we sit at, since sitting at
     the wrong one is the failure this whole feature exists to avoid.
+
+    `raises`: the error `connect()` must end with.
     """
     client = BelotClient(cookies="x", **kwargs)
     bridge = FakeBridge(script)
@@ -154,7 +157,11 @@ def _drive(script, **kwargs):
         finally:
             asyncio.sleep = orig
 
-    asyncio.run(go())
+    if raises is None:
+        asyncio.run(go())
+    else:
+        with pytest.raises(raises):
+            asyncio.run(go())
     return bridge, slept
 
 
@@ -345,3 +352,114 @@ def test_the_guest_does_not_squeeze_into_a_full_table():
     bridge, _ = _drive([{"event": "LOBBY", "mese": [FULL]}],
                        table_mode="join", table_id="new-44711111")
     assert not bridge.of("CONNECT")
+
+
+# ------------------------------------------------- a private table's password
+#
+# A private table is found like any other -- in the lobby, by its creator --
+# and entered with `enterGame=4&gameId=<id>&password=<password>`. The bridge has
+# always taken a password on a join; nothing ever gave it one.
+PRIVATE = dict(OURS, **{"pass": True})
+REFUSED = {"event": "ERROR", "code": "TABLE_NOT_FOUND",
+           "message": "Seat reservation failed at table new-44709391."}
+SEATED = {"event": "CONNECTED", "roomId": "r", "playerId": "p"}
+
+
+def _look(*tables):
+    return {"event": "LOBBY", "mese": list(tables)}
+
+
+def test_the_password_goes_with_the_seat_request():
+    bridge, _ = _drive([_look(SOMEONE_ELSE, PRIVATE)], table_mode="join",
+                       table_creator=HOST, table_password="s3cret")
+    assert [m["table"] for m in bridge.of("CONNECT")] == [
+        {"mode": "join", "tableId": "new-44709391", "password": "s3cret"}]
+
+
+def test_an_open_table_is_asked_for_without_one():
+    """Nothing changes for a pair: no password, no field."""
+    bridge, _ = _drive([_look(OURS)], table_mode="join", table_creator=HOST)
+    assert [m["table"] for m in bridge.of("CONNECT")] == [
+        {"mode": "join", "tableId": "new-44709391"}]
+
+
+def test_the_password_goes_with_a_return_to_the_table_too():
+    """The owner rotating the seats drops everyone (4005), and the way back
+    is a seat request like the first."""
+    from belotmd.platform.protocol import LEAVE_POSITION_CHANGED
+
+    bridge, _ = _drive(
+        [_look(PRIVATE), SEATED,
+         {"event": "LEAVE", "code": LEAVE_POSITION_CHANGED}],
+        table_mode="join", table_creator=HOST, table_password="s3cret")
+    joins = bridge.of("CONNECT")
+    assert len(joins) == 2
+    assert joins[1]["table"]["password"] == "s3cret"
+
+
+def test_the_password_reaches_the_client(tmp_path):
+    """From the account's file, through Config, to the client."""
+    from belotmd.bot import LiveBelotBot
+    from belotmd.config import Config
+
+    env = tmp_path / ".env.one"
+    env.write_text(os.linesep.join(["BELOT_COOKIES=x",
+                                    "BELOT_TABLE_PASSWORD=s3cret", ""]))
+    cfg = Config.from_env(env_file=str(env), audit=False, agent="random",
+                          table_mode="join", table_creator=HOST)
+    assert cfg.table_password == "s3cret"
+    assert LiveBelotBot(config=cfg).client.table_password == "s3cret"
+
+
+def test_a_wrong_password_is_not_tried_for_ever():
+    """A refused seat sends the client back to the lobby, which still lists
+    the table, which it then asks for again: one wrong password every two
+    seconds for as long as the run lasts, at somebody's private table."""
+    from belotmd.platform.client import TableJoinRefused
+
+    bridge, _ = _drive([_look(PRIVATE), REFUSED] * 6, raises=TableJoinRefused,
+                       table_mode="join", table_creator=HOST,
+                       table_password="wrong")
+    assert len(bridge.of("CONNECT")) == 3, "three tries, then it stops"
+
+
+def test_without_a_password_a_refused_seat_is_just_a_spent_look():
+    """The control, and the pair's behaviour: the host's table being taken or
+    deleted as the guest sits down is routine, and never ends the run."""
+    bridge, _ = _drive([_look(OURS), REFUSED] * 6,
+                       table_mode="join", table_creator=HOST)
+    assert len(bridge.of("CONNECT")) == 6
+
+
+def test_sitting_down_forgives_the_earlier_refusals():
+    from belotmd.platform.protocol import LEAVE_TABLE_REMOVED
+
+    bridge, _ = _drive(
+        [_look(PRIVATE), REFUSED, _look(PRIVATE), REFUSED,
+         _look(PRIVATE), SEATED, {"event": "LEAVE", "code": LEAVE_TABLE_REMOVED},
+         _look(PRIVATE), REFUSED, _look(PRIVATE), REFUSED],
+        table_mode="join", table_creator=HOST, table_password="s3cret")
+    assert len(bridge.of("CONNECT")) == 5, "four refusals, never three in a row"
+
+
+def test_a_network_error_is_not_a_refused_seat():
+    down = {"event": "ERROR", "message": "fetch failed"}
+    bridge, _ = _drive([_look(PRIVATE), down] * 6, table_mode="join",
+                       table_creator=HOST, table_password="s3cret")
+    assert len(bridge.of("CONNECT")) == 6
+
+
+def test_being_removed_from_a_table_we_joined_by_name_is_final():
+    """Looking the table up again would sit us straight back down, five
+    seconds after its owner took us off it, every time they did."""
+    from belotmd.platform.client import TableJoinRefused
+    from belotmd.platform.protocol import LEAVE_KICKED
+
+    bridge, slept = _drive(
+        [_look(PRIVATE), SEATED, {"event": "LEAVE", "code": LEAVE_KICKED},
+         _look(PRIVATE), SEATED],
+        raises=TableJoinRefused, table_mode="join", table_creator=HOST,
+        table_password="s3cret")
+    assert len(bridge.of("CONNECT")) == 1, "it went back"
+    assert len(bridge.of("LOBBY")) == 1, "it went looking for the table again"
+    assert slept == []

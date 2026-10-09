@@ -100,6 +100,7 @@ class LiveBelotBot:
             table_mode=self.config.table_mode,
             table_id=self.config.table_id or None,
             table_creator=self.config.table_creator or None,
+            table_password=self.config.table_password or None,
             join_poll_s=self.config.join_poll_s,
             join_max_polls=self.config.join_max_polls,
             max_create_failures=self.config.max_create_failures,
