@@ -26,7 +26,8 @@ from .game.actions import (ACTION_ACCEPT, ACTION_PASS, CARD_ACTIONS,
                            SUIT_ACTIONS, suit_of)
 from .platform.client import BelotClient
 from .platform.protocol import (ASCII_TO_ID, BID_PHASES, CHAR_TO_CARD,
-                                DEAL_PHASES, END_PHASES, ID_TO_ASCII,
+                                DEAL_PHASES, END_PHASES, GAME_ENDED,
+                                GAME_TYPE_TOURNAMENT, ID_TO_ASCII,
                                 NOT_STARTED, PLAY, SWAP_SEVEN, DEAL_CARDS_2,
                                 between_matches)
 from .platform.sync import StateSynchronizer
@@ -105,6 +106,8 @@ class LiveBelotBot:
             join_max_polls=self.config.join_max_polls,
             max_create_failures=self.config.max_create_failures,
             pair_restart_pause_s=self.config.pair_restart_pause_s,
+            tournament_min_status=self.config.tournament_min_status,
+            tournament_enroll=self.config.tournament_enroll,
         )
         self.sync_engine = StateSynchronizer()
 
@@ -213,6 +216,7 @@ class LiveBelotBot:
         self._room_since = None       # when we arrived at this table
         self._leave_sent = False      # one LEAVE_TABLE per table, at most
         self._table_started = False   # has a hand been dealt here?
+        self._game_type_warned = False  # a non-tournament room, reported once
 
     def _check_room_change(self):
         """Notice that the client joined a different table and start clean."""
@@ -303,6 +307,9 @@ class LiveBelotBot:
         # sent it, and sat in the lobby forever.
         if phase == NOT_STARTED or phase in END_PHASES:
             self._agent_reset()
+            if self._playing_a_tournament():
+                await self._tournament_boundary(raw_state, my_pos, phase)
+                return
             # Playing as a pair: the seats have to be right BEFORE we announce
             # ourselves. The match starts the moment all four players are
             # ready, so a READY sent at the wrong moment is what puts our two
@@ -370,6 +377,36 @@ class LiveBelotBot:
             self.last_dispatch_ts = now
 
             await self._select_and_execute_action(my_pos, turn_id)
+
+    def _playing_a_tournament(self):
+        config = getattr(self, "config", None)
+        return getattr(config, "table_mode", None) == "tournament"
+
+    async def _tournament_boundary(self, raw_state, my_pos, phase):
+        """Before a tournament match, between its hands, and after it.
+
+        Two rules differ from an ordinary table. READY goes out whatever stop
+        is pending: the match is the draw's, with a partner it gave us, and
+        the run ends when we are out of the tournament, not at a match
+        boundary (the client handles that). And once the match is over (14)
+        there is no next one here -- the site offers only leaving, so we
+        leave, and the tournament page says where we play next.
+        """
+        game_type = raw_state.get("gameType")
+        if (game_type and game_type != GAME_TYPE_TOURNAMENT
+                and not self._game_type_warned):
+            self._game_type_warned = True
+            print(f"[Bot][WARN] playing a tournament, but this room is a "
+                  f"{game_type} table, not {GAME_TYPE_TOURNAMENT}.")
+        if phase == GAME_ENDED:
+            if not self._leave_sent:
+                self._leave_sent = True
+                print("[Bot] Tournament match over; leaving the table, as the "
+                      "site's own button does.")
+                await self.client.leave_table()
+            return
+        if not self._server_says_ready(raw_state, my_pos):
+            await self._send_ready_debounced()
 
     def _partner_seat(self, raw_state):
         """Where our other account is sitting, or None if it is not here.

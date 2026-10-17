@@ -792,6 +792,93 @@ Consequences worth knowing:
 
 ---
 
+## 13. Tournaments
+
+Sixteen players, eight random teams of two, three knockout rounds (`1/4`,
+`semifinal`, `final`); the teams are redrawn every round, the 14-point rule is off,
+and each round is a match to 101 that goes on while both teams are past 101 and
+level. Read from the site's own `tournaments.js` and `gameplay.js`, and **[CAPTURED
+2026-10-17]** from one tournament played by hand to elimination in the 1/4.
+
+### The page
+
+Everything goes through `POST https://belot.md/tournaments.php`, a jQuery form post
+(`X-Requested-With: XMLHttpRequest`):
+
+| body | answer |
+|---|---|
+| `getState=1` | where we stand; the site's page polls it every **3 s** (`tournamentsRefreshRate = 3000`) |
+| `enroll=<id>` | `{"success":true}`, or `{"error": ...}`: `"no_status"` when the account's status is below the tournament's, otherwise free text, sometimes with an `actionBtn` link. The page itself checks only `error`, then polls |
+| `withdraw=1` | leaves the waiting room before the start (the "Renunță" button), or the bracket once we are out ("Continuă spre turnee noi"). The page hides it while we are still in the bracket |
+
+`getState` carries a `playerState`:
+
+- **`none`** — `tournaments`: one entry per tournament on offer, `{id, stake,
+  prizes: [first, second], numPlayers, maxPlayers: 16, minStatus, timeWaiting}`.
+  Numbers come as numbers or strings (`"stake": "200"`). Enrolling takes the `id`.
+  Also `latestTournaments` (finished ones, with player names) and `numLive`.
+- **`enrolled`** — the waiting room: `tournamentInfo {id, stake, prizes, numPlayers,
+  maxPlayers, minStatus, timeWaiting, estTimeStart}`, and `suitGameStake` (a coin
+  mini-game on the page; never call `suitGuess`).
+- **`playing`** — the bracket: `phase`, `isEliminated`, `gotCashback`,
+  `tournamentId`, `duration`, `prizes [first, second, cashback]`, `playersInfo`
+  (player id → name and status), `progress`, and once over `winners` (four player
+  ids: the two winners, then the two runners-up). **`isAtTable: true`** means our
+  table is ready, and the page then simply opens `gameplay_new.php`: the site seats
+  us itself, with no `enterGame`. The first seat of a tournament already comes as
+  `playing` + `isAtTable`.
+
+`progress[stage]` is the list of that stage's tables, `{playerIds, score, winner,
+gameTableId}`. **`playerIds` are in-room player ids** — the account's own is the
+`playerId` in `gameplay_new.php`'s `customData` (and `myPlayerId` on the page), so a
+client finds its own table, seat and team there. Teams are indexes 0+2 against 1+3,
+the room's own pairing. A table being played has `winner: -1` and `score: [0, 0]`
+(numbers); a finished one loses its `gameTableId` and carries its scores as strings
+(`["101", "111"]`) and `winner` 0 or 1. Eliminated, the page stays `playing` —
+`isEliminated: true`, the phase moving on without us — until `withdraw=1`.
+
+### The table
+
+`gameplay_new.php` carries the same four values as at any table (`wsUrl`, `roomId`,
+`playerToken`, `playerId`) and the room is joined the same way (`matchmake/joinById`,
+then the WebSocket), so the bridge's usual first step — rejoin the room that page
+names — takes the seat. The page also sets `less14Rule: false`, `randomPartners:
+true`, `reducedCombo: false` and `tournamentPhase`, and its `leaveRoom()` goes to
+`tournaments.php` instead of the lobby. In the room:
+
+- **`gameType` is `"TOURNAMENT_4"`** (an ordinary table's is `"GAME_4"`, in every
+  recording).
+- **READY still starts the match** ("Esti aici? … Sunt gata").
+- **Once the match is over (14) there is no "one more game"**, only "Ieși de la masă",
+  which sends `LEAVE_TABLE`; the room then closes (`I_LEFT`, or `TABLE_REMOVED` if the
+  site closes it first) and the browser returns to the tournament page. Winning or
+  losing takes the same path.
+- Emoji are restricted in tournaments, with a warning that hinting to a partner is
+  punished.
+
+### How the client plays one (`BELOT_TABLE_MODE=tournament`)
+
+The page is the only authority: every step starts with `getState`, and each answer
+leads to exactly one next request. Not enrolled → enrol in a tournament whose
+`minStatus` is exactly `tournament_min_status`, the fullest first. Waiting room →
+poll, or `withdraw` at once if a stop is pending. `isAtTable` → `CONNECT` in
+tournament mode, where the bridge takes the room `gameplay_new.php` names or reports
+`TOURNAMENT_NO_ROOM` — it **never falls back to the lobby**. At 14 the bot sends
+`LEAVE_TABLE`; any close but `4001` goes back to polling (a dropped connection at
+once, so the poll finds the seat still ours). Out → `withdraw`, then the session
+ends. A stop pending in the bracket waits until we are out: READY goes out at a
+tournament table whatever is pending. The bridge strips `playersInfo` and
+`latestTournaments` before anything reaches Python, and passes nothing on from an
+answer that is not JSON.
+
+**Not yet seen** (handled defensively): the answers a winner gets between rounds;
+`phase: "finished"` with `winners`; whether the site keeps reporting `isAtTable` for
+a table whose match has just finished (the client declines a seat whose table already
+has a winner, for at most ten polls); whether a withdrawal from the waiting room
+refunds the stake.
+
+---
+
 ## 11. Still unverified
 
 1. **`trumpWasPlayed` semantics.** It resets per hand and flips mid-hand, but it

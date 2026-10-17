@@ -111,6 +111,12 @@ wss.on('connection', (pySocket) => {
                 // unit-tested and where the partner's name is configured. The
                 // bridge only fetches the list.
                 say({ event: "LOBBY", mese: await fetchLobby(cmd.cookies) });
+            } else if (cmd.action === "TOURNAMENT") {
+                // The tournament page's three calls. Which tournament, and
+                // when to enrol or withdraw, is decided in Python, where the
+                // rules are tested; the bridge only carries the request.
+                say({ event: "TOURNAMENT", op: cmd.op,
+                      ...(await tournamentCall(cmd.cookies, cmd.op, cmd.id)) });
             } else if (cmd.action === "SEND") {
                 // Tagged, so Python can tell a move that arrived after the
                 // room closed from a join that failed.
@@ -212,6 +218,15 @@ async function connectToGame(cookieString, say, session, avoidLast = false,
                 err.code = "TABLE_NOT_FOUND";
                 throw err;
             }
+        } else if (table && table.mode === "tournament") {
+            // The tournament seats us itself: tournaments.php said `isAtTable`,
+            // and the only room that can be ours is the one gameplay_new.php
+            // names, read above. Not there yet means ask the tournament again
+            // -- never the public lobby below, which would sit an enrolled
+            // account at a stranger's table while its tournament goes on.
+            const err = new Error("The tournament says we have a table, but gameplay_new.php names no room yet.");
+            err.code = "TOURNAMENT_NO_ROOM";
+            throw err;
         } else {
             console.log("[Bridge] No active game. Searching public tables...");
             const lobbyParams = new URLSearchParams({ getMeseNew: "1", nrJucatori: "4", minStatus: "0" });
@@ -293,6 +308,50 @@ async function fetchLobby(cookieString) {
                               signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
     const data = await res.json();
     return data.mese || [];
+}
+
+// tournaments.php, as the site's own page calls it: a form POST, which is what
+// jQuery's $.post sends, including its X-Requested-With header.
+const TOURNAMENT_FORMS = {
+    state: () => ({ getState: "1" }),
+    enroll: (id) => ({ enroll: String(id) }),
+    withdraw: () => ({ withdraw: "1" }),
+};
+
+// -> { data } with the parsed answer, or { error } saying why there is none.
+// Never throws: a failed poll is an ordinary event in a long wait, and Python
+// decides what it means.
+async function tournamentCall(cookieString, op, id) {
+    const form = TOURNAMENT_FORMS[op];
+    if (!form) return { error: `unknown tournament call "${op}"` };
+    try {
+        const res = await fetch("https://belot.md/tournaments.php", {
+            method: "POST",
+            headers: { ...buildHeaders(cookieString),
+                       'Referer': 'https://belot.md/tournaments.php',
+                       'X-Requested-With': 'XMLHttpRequest' },
+            body: new URLSearchParams(form(id)),
+            signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
+        const text = await res.text();            // always drain the body
+        try {
+            return { data: withoutNames(JSON.parse(text)) };
+        } catch (_) {
+            // A logged-out session gets a page, not JSON. Its text is not
+            // passed on: it is HTML, and it may carry other players' names.
+            return { error: `tournaments.php answered HTTP ${res.status} with ${text.length} bytes that are not JSON` };
+        }
+    } catch (err) {
+        return { error: `tournaments.php: ${err.message}` };
+    }
+}
+
+// Other players' names never leave the bridge. `playersInfo` maps the bracket's
+// player ids to usernames and `latestTournaments` lists finished tournaments
+// with theirs; nothing in Python needs either.
+function withoutNames(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return data;
+    const { playersInfo, latestTournaments, ...rest } = data;
+    return rest;
 }
 
 // The four values every join needs, scraped from `window.customData` on the

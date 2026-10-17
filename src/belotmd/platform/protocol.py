@@ -58,6 +58,15 @@ SWAP_PHASE  = SWAP_SEVEN                             # round-1 accept only
 END_PHASES  = (ROUND_ENDED, GAME_ENDED)              # hand scored / match over
 
 
+# ------------------------------------------------------------- table kinds
+# `gameType` in every state frame, named as the site's gameplay.js names them.
+# An ordinary table is GAME_4 (every recording so far). A tournament table is
+# TOURNAMENT_4: once its match is over the site offers no "one more game",
+# only leaving, and the tournament page says where we go next.
+GAME_TYPE_TABLE = "GAME_4"
+GAME_TYPE_TOURNAMENT = "TOURNAMENT_4"
+
+
 # ------------------------------------------------------------- leave codes
 # Colyseus room close codes used by belot.md.
 LEAVE_OTHER_SESSION    = 4001   # our account opened the table elsewhere

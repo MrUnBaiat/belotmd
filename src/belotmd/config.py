@@ -104,12 +104,24 @@ class Config:
     # and useless for a pair. Two of our accounts meet by having the host
     # "create" a table and the guest "join" the one that host made -- found in
     # the lobby by the host's username, so the two processes never talk.
+    # "tournament" enrols in ONE tournament and plays every table it seats us
+    # at, until we are out of it; then the session ends.
     table_mode: str = "lobby"
     table_id: str = ""
     table_creator: str = ""
     # The password of a private table, sent with the seat reservation when
     # joining. Empty for an open table.
     table_password: str = ""
+
+    # --- tournaments ---
+    # Enter only tournaments whose minimum status is exactly this: the
+    # account's own (5, Expert, for ours), so never one it cannot enter and
+    # never one meant for weaker players. Among several, the fullest.
+    tournament_min_status: int = 5
+    # False: only go back to a tournament the account is already in, never
+    # enrol in a new one. A supervisor that restarts a session in the middle
+    # of a tournament sets this, so one run never becomes two tournaments.
+    tournament_enroll: bool = True
 
     # Our other account's username. Setting it means "we are playing as a
     # pair": the bot then withholds READY until that account is sitting

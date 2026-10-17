@@ -19,8 +19,10 @@ import websockets
 # WHILE handling the original error, and the real failure is lost.
 from websockets.exceptions import WebSocketException
 
+from . import tournaments as tour
 from .protocol import (CHAR_TO_CARD, LEAVE_NAMES,  # noqa: F401  (re-exported)
-                       LEAVE_KICKED, LEAVE_POSITION_CHANGED, NOT_STARTED,
+                       LEAVE_KICKED, LEAVE_OTHER_SESSION,
+                       LEAVE_POSITION_CHANGED, NOT_STARTED,
                        RECOVER_LATER, RECOVER_NOW, RECOVER_SOON, RECOVER_STOP,
                        SUIT_TO_INT, between_matches, leave_recovery,
                        match_underway)
@@ -45,6 +47,12 @@ class TableJoinRefused(RuntimeError):
     owner removed us."""
 
 
+class TournamentError(RuntimeError):
+    """The tournament run cannot go on: belot.md refused the enrolment, offers
+    no tournament for our status, never answered at all, or the account was
+    opened somewhere else while it played."""
+
+
 class BelotClient:
     def __init__(self, cookies: str, bridge_port: int = 0,
                  reconnect: bool = True, retry_delay_s: float = 300.0,
@@ -53,7 +61,10 @@ class BelotClient:
                  join_poll_s: float = 2.0, join_max_polls: int = 20,
                  pair_restart_pause_s: float = 10.0,
                  max_create_failures: int = 3,
-                 table_password: str = None):
+                 table_password: str = None,
+                 tournament_min_status: int = 5,
+                 tournament_enroll: bool = True,
+                 tournament_poll_s: float = tour.POLL_S):
         """`reconnect` keeps the bot looking for tables instead of exiting.
 
         Two delays, because two very different situations end a session:
@@ -74,8 +85,9 @@ class BelotClient:
         self.bridge_port = bridge_port
         self.bridge_token = secrets.token_hex(16)
         # Which table to sit at. "lobby" is the historic behaviour (the first
-        # open public table). A pair uses the other two: the host "create"s a
-        # table and the guest "join"s the one that host made.
+        # open public table). A pair uses the next two: the host "create"s a
+        # table and the guest "join"s the one that host made. "tournament"
+        # enrols in one tournament and plays the tables it seats us at.
         self.table_mode = table_mode
         self.table_id = table_id
         self.table_creator = table_creator
@@ -124,6 +136,31 @@ class BelotClient:
         # to, rather than a new table -- the bot must not treat it as fresh.
         self.resumed_match = False
 
+        # --- "tournament" mode ----------------------------------------------
+        # Which tournaments we may enter: exactly the account's own status.
+        self.tournament_min_status = int(tournament_min_status)
+        # False when this run may only go back to a tournament it is already
+        # in, never enrol in a new one (a supervisor resuming after a crash).
+        self.tournament_enroll = bool(tournament_enroll)
+        self.tournament_poll_s = float(tournament_poll_s)
+        # Set by whoever is stopping the run. In the waiting room it means
+        # withdraw now; in the bracket it means stop once we are out of it.
+        self.stop_requested = False
+        # Why our tournament ended, once it has: the session's normal end.
+        self.tournament_over = None
+        # Answers tournaments.php actually gave: proof of life while there are
+        # no frames to be had, in a waiting room or between two rounds.
+        self.tournament_answers = 0
+        # What happened, for the session log. Our own results only.
+        self.tournament = {}
+        self._t_failures = 0          # failed calls in a row
+        self._t_enrolls = 0           # enrolments sent
+        self._t_withdraws = 0         # withdrawals sent
+        self._t_refusal = None        # the last enrolment refusal, unconfirmed
+        self._t_stale_seat = 0        # polls offering a seat at a decided table
+        self._t_in = False            # the page has shown us in a tournament
+        self._t_said = None           # last status line, so polls stay quiet
+
     # The local socket to the bridge: no keepalive, and no flow control on
     # reading. It is a loopback link to our own child process, whose death
     # closes it at once, so a keepalive detects nothing there -- but it can
@@ -135,6 +172,18 @@ class BelotClient:
     # the table, and the match was abandoned. A bridge that hangs without
     # dying shows up instead as a run that receives no frames.
     BRIDGE_SOCKET = {"ping_interval": None, "max_queue": None}
+
+    # Failed tournaments.php calls in a row, before it has answered even once,
+    # that end the run: a logged-out cookie gets a page instead of JSON, every
+    # time, and polling it for an hour proves nothing more.
+    MAX_TOURNAMENT_FAILURES = 5
+    # Enrolments, and withdrawals, sent before giving up on the site taking
+    # one. Each is re-sent only when the next poll shows it did not land.
+    MAX_ENROLLS = 3
+    MAX_WITHDRAWS = 3
+    # Polls (3 s each) that a seat at a table whose match is already decided
+    # is declined, before it is taken anyway (see `_on_tournament_state`).
+    STALE_SEAT_POLLS = 10
 
     # Refused seats in a row at a password table before giving up on it. A
     # table that vanished or filled as we sat down explains one or two; after
@@ -378,6 +427,13 @@ class BelotClient:
                                 delay=self.join_poll_s):
                             break
 
+                elif event == "TOURNAMENT":
+                    # "tournament" mode: an answer from tournaments.php. Each
+                    # one leads to exactly one next request, so there is never
+                    # more than one poll in flight.
+                    if not await self._on_tournament(ws, msg):
+                        break
+
                 elif event == "ERROR":
                     code = msg.get("code")
                     detail = msg.get("message") or code
@@ -389,6 +445,16 @@ class BelotClient:
                         # must not be read as one failing. Live (2026-09-29) it
                         # was, and started a second five-minute wait while the
                         # bridge was already back in the match.
+                        continue
+                    if self.table_mode == "tournament":
+                        # Taking the seat the tournament gave us failed --
+                        # gameplay_new.php had no room on it yet, or the
+                        # network. The tournament knows whether the seat is
+                        # still ours, so ask it rather than any lobby.
+                        if not self._in_room:
+                            print(f"[SDK][Tournament] could not take our seat "
+                                  f"({detail}); asking the tournament again.")
+                            await self._poll_tournament(ws, self.tournament_poll_s)
                         continue
                     rescuing = time.monotonic() < self._rescue_until
                     # An error while we are NOT in a room means the join
@@ -466,6 +532,11 @@ class BelotClient:
                     mid_match = not between_matches(self._phase)
                     self._in_room = False
                     restart_pause = None
+                    if self.table_mode == "tournament":
+                        if not await self._left_tournament_table(
+                                ws, code, label, mid_match):
+                            break
+                        continue
                     if code == LEAVE_KICKED and self.table_mode == "join":
                         # We came to this table by name, and its owner took us
                         # off it. Looking it up again would sit us straight
@@ -552,6 +623,289 @@ class BelotClient:
         print(f"[SDK][STOP] {self.fatal}")
         print("=" * 72)
 
+    # ------------------------------------------------------------ tournaments
+    #
+    # One tournament per session. Its page is the only authority on where we
+    # stand, so every step starts by asking it (`getState`), and each answer
+    # leads to exactly one next request:
+    #
+    #   none       not enrolled yet  -> enrol in one for our status
+    #              enrolled before   -> it is over for us: end the session
+    #   enrolled   the waiting room  -> poll; withdraw at once if stopping
+    #   playing    our table is set  -> take the seat (the room gameplay_new.php
+    #                                   names; never a lobby table)
+    #              out of it         -> withdraw from the bracket, as the site's
+    #                                   own "continue" button does, and end
+    #              anything else     -> poll: the other tables are still playing
+    #
+    # A stop requested while we are in the bracket waits until we are out of
+    # it: walking away mid-tournament abandons a partner the draw gave us, and
+    # belot.md penalises an account that leaves matches.
+
+    async def _ask_tournament(self, ws, op, **extra):
+        """One call to tournaments.php, through the bridge. The answer comes
+        back as a TOURNAMENT event."""
+        request = {"action": "TOURNAMENT", "op": op, "cookies": self.cookies}
+        request.update(extra)
+        await ws.send(json.dumps(request))
+
+    async def _poll_tournament(self, ws, delay):
+        """Ask where we stand, after `delay` seconds."""
+        if delay:
+            await asyncio.sleep(delay)
+        await self._ask_tournament(ws, "state")
+
+    async def _take_tournament_seat(self, ws):
+        """The tournament has seated us: enter the room gameplay_new.php names.
+
+        The bridge reads that page before anything else, and in this mode it
+        falls back to nothing -- no lobby, no table of its own choosing.
+        """
+        self._in_room = False
+        self._phase = NOT_STARTED
+        await ws.send(json.dumps({"action": "CONNECT", "cookies": self.cookies,
+                                  "avoidLast": False,
+                                  "table": {"mode": "tournament"}}))
+
+    def _say_tournament(self, line):
+        """A status line, printed only when it changes: polls come every 3 s."""
+        if line != self._t_said:
+            self._t_said = line
+            print(f"[SDK][Tournament] {line}")
+
+    def _end_tournament_run(self, reason=None, fatal=None):
+        """End the session: normally, for `reason`, or with `fatal`, which
+        `connect` raises once it has closed. -> False, to leave the loop."""
+        if fatal is not None:
+            self.fatal = fatal
+            print("=" * 72)
+            print(f"[SDK][STOP] {fatal}")
+            print("=" * 72)
+        else:
+            self.tournament_over = reason
+            self.tournament.setdefault("result", reason)
+            print(f"[SDK][Tournament] done: {reason}.")
+        return False
+
+    async def _on_tournament(self, ws, msg):
+        """An answer from tournaments.php. -> False to end the session."""
+        op = msg.get("op")
+        data = msg.get("data")
+        if msg.get("error") is not None or not isinstance(data, dict):
+            self._t_failures += 1
+            why = msg.get("error") or "an answer that is not an object"
+            print(f"[SDK][Tournament] {op} failed ({self._t_failures} in a "
+                  f"row): {why}")
+            if (not self.tournament_answers
+                    and self._t_failures >= self.MAX_TOURNAMENT_FAILURES):
+                return self._end_tournament_run(fatal=TournamentError(
+                    f"tournaments.php failed {self._t_failures} times in a row "
+                    f"without answering once (last: {why}). Is the login "
+                    f"cookie still valid?"))
+            # Whatever the call was, the next poll shows whether it landed.
+            await self._poll_tournament(ws, self.tournament_poll_s)
+            return True
+        self._t_failures = 0
+
+        if op == "enroll":
+            # Only the next poll says whether we are in: a refusal such as
+            # "already enrolled" is no refusal at all, and a success the
+            # page does not reflect is no enrolment. The refusal is kept, and
+            # ends the run only if the poll finds us in no tournament.
+            self._t_refusal = data.get("error")
+            print("[SDK][Tournament] " + (
+                f"belot.md refused the enrolment: {self._t_refusal}"
+                if self._t_refusal else "enrolment accepted."))
+            await self._poll_tournament(ws, 0)
+            return True
+
+        if op == "withdraw":
+            refusal = data.get("error")
+            if refusal:
+                print(f"[SDK][Tournament] belot.md refused the withdrawal: "
+                      f"{refusal}")
+            else:
+                print("[SDK][Tournament] withdrawn.")
+                self.tournament["withdrew"] = True
+            await self._poll_tournament(
+                ws, self.tournament_poll_s if refusal else 0)
+            return True
+
+        return await self._on_tournament_state(ws, data)
+
+    async def _on_tournament_state(self, ws, state):
+        """Where we stand -> the one next step. -> False to end the session."""
+        self.tournament_answers += 1
+        player_state = state.get("playerState")
+
+        if player_state == tour.NONE:
+            if self._t_in:
+                # We withdrew, our tournament finished, or the waiting room
+                # closed under us. Either way it is over, and a session
+                # plays one.
+                if (not self.tournament.get("result")
+                        and self.tournament.get("withdrew")):
+                    self.tournament["result"] = ("withdrew from the waiting "
+                                                 "room before the start")
+                return self._end_tournament_run(
+                    reason=self.tournament.get("result")
+                    or "the tournament no longer lists us")
+            if self._t_refusal:
+                hint = (" -- this account's status is below the tournament's "
+                        "minimum" if self._t_refusal == "no_status" else "")
+                return self._end_tournament_run(fatal=TournamentError(
+                    f"belot.md refused the enrolment: {self._t_refusal}{hint}"))
+            if self.stop_requested:
+                return self._end_tournament_run(
+                    reason="stopped before enrolling")
+            if not self.tournament_enroll:
+                return self._end_tournament_run(
+                    reason="not in a tournament, and this session may not "
+                           "enrol in another")
+            return await self._enrol(ws, state.get("tournaments"))
+
+        if player_state in (tour.ENROLLED, tour.PLAYING):
+            self._t_in = True
+            self._t_refusal = None
+
+        if player_state == tour.ENROLLED:
+            if self.stop_requested and self._t_withdraws < self.MAX_WITHDRAWS:
+                self._t_withdraws += 1
+                print("[SDK][Tournament] stopping in the waiting room: "
+                      "withdrawing now.")
+                await self._ask_tournament(ws, "withdraw")
+                return True
+            info = state.get("tournamentInfo") or {}
+            self._say_tournament(
+                f"waiting room: {info.get('numPlayers', '?')}/"
+                f"{info.get('maxPlayers', '?')} players")
+            await self._poll_tournament(ws, self.tournament_poll_s)
+            return True
+
+        if player_state == tour.PLAYING:
+            self._note_tournament(state)
+            if tour.is_out(state):
+                if self._t_withdraws < self.MAX_WITHDRAWS:
+                    self._t_withdraws += 1
+                    print(f"[SDK][Tournament] {self.tournament['result']}; "
+                          f"leaving the bracket.")
+                    await self._ask_tournament(ws, "withdraw")
+                    return True
+                return self._end_tournament_run(
+                    reason=self.tournament["result"])
+            if state.get("isAtTable"):
+                ours = tour.our_table(state, self.my_player_id)
+                # Our latest table already having a winner means the site
+                # still counts us at the table that just finished: taking that
+                # seat would only walk back into a finished match. But only
+                # for so long -- a site that seats us before it lists the next
+                # round must not leave us waiting while that round starts.
+                self._t_stale_seat += 1
+                if (ours is None or ours["won"] is None
+                        or self._t_stale_seat > self.STALE_SEAT_POLLS):
+                    print(f"[SDK][Tournament] our table for the "
+                          f"{state.get('phase')} is ready; taking the seat.")
+                    self._t_said = None
+                    self._t_stale_seat = 0
+                    await self._take_tournament_seat(ws)
+                    return True
+            else:
+                self._t_stale_seat = 0
+            self._say_tournament(
+                f"in the {state.get('phase')}; waiting for our table"
+                + (" (a stop is pending: it takes effect once we are out)"
+                   if self.stop_requested else ""))
+            await self._poll_tournament(ws, self.tournament_poll_s)
+            return True
+
+        print(f"[SDK][Tournament][WARN] unrecognised playerState "
+              f"{player_state!r}; asking again.")
+        await self._poll_tournament(ws, self.tournament_poll_s)
+        return True
+
+    async def _enrol(self, ws, tournaments):
+        """Enter one tournament for our status: the fullest, which starts
+        soonest. -> False to end the session."""
+        status = self.tournament_min_status
+        pick = tour.pick_tournament(tournaments, status)
+        if pick is None:
+            if not tour.offers_status(tournaments, status):
+                return self._end_tournament_run(fatal=TournamentError(
+                    f"belot.md lists no tournament with minimum status "
+                    f"{status}"))
+            self._say_tournament(f"every tournament with minimum status "
+                                 f"{status} is full; waiting for a place")
+            await self._poll_tournament(ws, self.tournament_poll_s)
+            return True
+        if self._t_enrolls >= self.MAX_ENROLLS:
+            return self._end_tournament_run(fatal=TournamentError(
+                f"enrolled {self._t_enrolls} times, and the site still lists "
+                f"us in no tournament"))
+        self._t_enrolls += 1
+        slot = str(pick.get("id"))
+        stake = tour.as_int(pick.get("stake"))
+        self.tournament.update(slot=slot, stake=stake, min_status=status)
+        print(f"[SDK][Tournament] enrolling in tournament {slot} (minimum "
+              f"status {status}, stake {stake}, "
+              f"{pick.get('numPlayers')}/{pick.get('maxPlayers')} enrolled).")
+        await self._ask_tournament(ws, "enroll", id=slot)
+        return True
+
+    def _note_tournament(self, state):
+        """Keep the session log's account current: the tournament's id, our
+        score at each stage, and once we are out, how it ended for us."""
+        if state.get("tournamentId") is not None:
+            self.tournament["id"] = str(state["tournamentId"])
+        tables = tour.our_tables(state, self.my_player_id)
+        if tables:
+            self.tournament.setdefault("stages", {}).update(tables)
+        if tour.is_out(state) and "result" not in self.tournament:
+            self.tournament["result"] = self._tournament_result(state)
+            self.tournament["cashback"] = bool(state.get("gotCashback"))
+
+    def _tournament_result(self, state):
+        """How the tournament ended for us, in words."""
+        place = tour.placing(state, self.my_player_id)
+        if place == "won":
+            return "won the tournament"
+        if place == "second":
+            return "second in the tournament"
+        ours = tour.our_table(state, self.my_player_id)
+        if ours is not None:
+            score = (f" ({ours['us']}-{ours['them']})"
+                     if ours["us"] is not None and ours["them"] is not None
+                     else "")
+            return f"eliminated in the {ours['stage']}{score}"
+        return ("eliminated" if state.get("isEliminated")
+                else "the tournament finished")
+
+    async def _left_tournament_table(self, ws, code, label, mid_match):
+        """A tournament table closed. -> False to end the session.
+
+        Every close but one goes back to the tournament, which says what comes
+        next: the end of a match played out (we leave at phase 14 ourselves,
+        I_LEFT, or the site closes the table, TABLE_REMOVED), or a dropped
+        connection, after which the tournament still has the seat as ours.
+        """
+        self._leaving_to_restart = False
+        if code == LEAVE_OTHER_SESSION:
+            # This account was opened somewhere else -- most likely a browser
+            # on the tournament page, which goes to the table by itself.
+            # Taking the seat back would throw them out, and they us, for ever.
+            return self._end_tournament_run(fatal=TournamentError(
+                f"this account was opened somewhere else ({label}, {code}), "
+                f"and whoever opened it has the seat now. Close every other "
+                f"belot.md tab of this account before a tournament run"))
+        delay = 0.0
+        if (leave_recovery(code, mid_match=mid_match) == RECOVER_NOW
+                and code != LEAVE_POSITION_CHANGED):
+            delay = self._after_a_drop(mid_match) or 0.0
+        print(f"[SDK][Tournament] left the table ({label}, {code}); asking "
+              f"the tournament where we stand.")
+        self._t_said = None
+        await self._poll_tournament(ws, delay)
+        return True
+
     def _after_a_drop(self, mid_match):
         """We lost the room without being removed from it. -> the pause before
         going back, or None for at once.
@@ -588,6 +942,12 @@ class BelotClient:
         """
         self._in_room = False
         self._phase = NOT_STARTED
+
+        if self.table_mode == "tournament":
+            # Tables come from the tournament, never from a lobby: ask it
+            # where we stand, and its answer says what to do next.
+            await self._ask_tournament(ws, "state")
+            return
 
         if table_id is None and self._rejoin_hint:
             # We were moved off our seat, not off the table. The lobby would
