@@ -17,12 +17,13 @@ from belotmd.platform.client import BelotClient
 from belotmd.platform.tables import (CREATE_TABLE_BODY, creator_name,
                                      find_table, is_joinable, table_id_of)
 
-# The captured lobby entry for a table one of our accounts created, as a second
-# account sees it. `creator` is [level, username, account id].
-HOST = "Mocasin123"
+# The shape of a captured lobby entry for a table one of our accounts created,
+# as a second account sees it. `creator` is [level, username, account id]; the
+# name and the id here are made up.
+HOST = "HostAccount"
 OURS = {"id": "new-44709391", "regula_14": 1, "type": 4, "colors": 1,
         "masa": 101, "players": "3", "time": 4, "pass": False,
-        "creator": ["4", HOST, "104325"], "full": 0}
+        "creator": ["4", HOST, "100001"], "full": 0}
 SOMEONE_ELSE = {"id": "new-44700000", "pass": False, "full": 0,
                 "creator": ["2", "SomebodyElse", "999"]}
 FULL = dict(OURS, id="new-44711111", full=1)

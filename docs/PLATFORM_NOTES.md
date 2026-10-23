@@ -671,7 +671,7 @@ returns `{"mese": [...]}`. One entry, for a table one of our accounts created:
 
 ```json
 {"id": "new-44709391", "regula_14": 1, "type": 4, "colors": 1, "masa": 101,
- "players": "3", "time": 4, "pass": false, "creator": ["4", "<username>", "104325"],
+ "players": "3", "time": 4, "pass": false, "creator": ["4", "<username>", "<account id>"],
  "full": 0}
 ```
 
@@ -727,7 +727,7 @@ values. This is the same call the lobby pick already used — only the `gameId`
 differs.
 
 **A private table** (`pass: true` in the lobby listing) takes the same call with
-its password filled in: `enterGame=4&gameId=new-46150679&password=<password>`.
+its password filled in: `enterGame=4&gameId=new-<id>&password=<password>`.
 This is the account owner's description of the site's own request (2026-10-09);
 no recorded run has exercised it yet, and what a wrong password answers is not
 known — the bridge treats anything but `{"success":"gameplay_new.php"}` as a

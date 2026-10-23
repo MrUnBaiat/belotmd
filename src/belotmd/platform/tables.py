@@ -36,7 +36,7 @@ CREATE_TABLE_BODY = (
 def creator_name(table):
     """The username that created a lobby table, or None.
 
-    Observed shape: `"creator": ["4", "<username>", "104325"]` — a level, the
+    Observed shape: `"creator": ["4", "<username>", "<account id>"]` — a level, the
     name, and an account id that is NOT the in-room player id, so the name is
     the only field that can be matched against something we configured.
     """
