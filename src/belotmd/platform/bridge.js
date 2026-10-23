@@ -350,7 +350,9 @@ async function tournamentCall(cookieString, op, id) {
 // with theirs; nothing in Python needs either.
 function withoutNames(data) {
     if (!data || typeof data !== "object" || Array.isArray(data)) return data;
-    const { playersInfo, latestTournaments, ...rest } = data;
+    const rest = { ...data };
+    delete rest.playersInfo;
+    delete rest.latestTournaments;
     return rest;
 }
 
