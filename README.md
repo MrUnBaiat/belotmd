@@ -178,7 +178,7 @@ selected.
 ## Verification
 
 ```bash
-pytest                                    # 128 tests, no network needed
+pytest                                    # 360 tests, no network needed
 ```
 
 After a live session you also have a recording to replay:
